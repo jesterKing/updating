@@ -1,0 +1,47 @@
+diff -ru libtiff-v4.3.0/CMakeLists.txt libtiff-v4.3.0-copy/CMakeLists.txt
+--- libtiff-v4.3.0/CMakeLists.txt	2021-12-13 10:22:45.000000000 +0200
++++ libtiff-v4.3.0-copy/CMakeLists.txt	2021-12-13 10:22:09.000000000 +0200
+@@ -137,12 +137,12 @@
+ # Process subdirectories
+ add_subdirectory(port)
+ add_subdirectory(libtiff)
+-add_subdirectory(tools)
+-add_subdirectory(test)
+-add_subdirectory(contrib)
+-add_subdirectory(build)
+-add_subdirectory(man)
+-add_subdirectory(html)
++#add_subdirectory(tools)
++#add_subdirectory(test)
++#add_subdirectory(contrib)
++#add_subdirectory(build)
++#add_subdirectory(man)
++#add_subdirectory(html)
+ 
+ 
+ message(STATUS "")
+diff -ru libtiff-v4.3.0/libtiff/CMakeLists.txt libtiff-v4.3.0-copy/libtiff/CMakeLists.txt
+--- libtiff-v4.3.0/libtiff/CMakeLists.txt	2021-12-13 10:22:45.000000000 +0200
++++ libtiff-v4.3.0-copy/libtiff/CMakeLists.txt	2021-12-13 10:22:09.000000000 +0200
+@@ -189,12 +189,12 @@
+ 
+ endif()
+ 
+-add_executable(mkg3states)
+-target_sources(mkg3states PRIVATE mkg3states.c tif_fax3.h)
+-target_link_libraries(mkg3states tiff port)
+-
+-add_custom_target(faxtable
+-        DEPENDS mkg3states
+-        COMMAND ${CMAKE_COMMAND} -E rm "tif_fax3sm.c"
+-        COMMAND mkg3states -b -c const "tif_fax3sm.c"
+-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
++#add_executable(mkg3states)
++#target_sources(mkg3states PRIVATE mkg3states.c tif_fax3.h)
++#target_link_libraries(mkg3states tiff port)
++#
++#add_custom_target(faxtable
++#        DEPENDS mkg3states
++#        COMMAND ${CMAKE_COMMAND} -E rm "tif_fax3sm.c"
++#        COMMAND mkg3states -b -c const "tif_fax3sm.c"
++#        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")

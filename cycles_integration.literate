@@ -1,0 +1,1917 @@
+# RhinoCycles, The Book
+
+There are several parts to integrating Cycles: syncing the source code with
+upstream Cycles code base, applying RhinoCycles patches, updating bindings and
+adapt client code using Cycles and the integration.
+
+The goal of this book is to address each of this areas whilst simultanously
+creating all the code needed to create a workable Cycles integration into
+Rhinoceros 3D.
+
+## Part I: codebase syncing
+
+We are maintaining a repository similar to the main Cycles repository
+git@git.blender.org:/cycles.git. Since the main repository is updated with the
+Blender Cycles code base in git@git.blender.org:/blender.git rather infrequently
+we do similar updating ourselves on a much more regular basis. There are still
+manual steps to the process used by the Cycles developers, and as such we are
+trying to automate this as much as possible.
+
+We will handle the syncing in the branch  `rhinomaster` in the repository
+https://github.com/mcneel/cycles, which is a fork of the original standalone
+repository.
+
+To determine commits to transfer we create a map from logs using as the key the
+subject decorated with the timestamp from the author. The log is created with as
+format `%H %at %s`, which gives the commit hash, the author timestamp and the
+subject. The hash will be used as value to its key.
+
+``` py : <<git log for repository>>=
+    command = (c for c in (b"git",
+               b"--git-dir=" + os.path.join(repository, b'.git'),
+               b"--work-tree=" + repository,
+               b"log", b"--format=%H %at %s", b"--reverse",
+               start_commit + b'..HEAD' if len(start_commit)>0 else '',
+               os.path.join(repository, path))
+               if len(c)>0
+    )
+```
+
+The goal is to have matching subjects and author times between the repositories.
+Although it is highly unlikely that two commits in seperate repositories are
+created at the exact very time the subject of the commit is taken along. That
+said, it is a good idea to first check on the timestamp and take the subject
+into account only when the timestamps exactly match. Once this is the case we
+can compare the subjects of the commits. Calculating an edit distance could be
+useful to determine commits that are the same, even though the subjects differ
+slightly.
+
+If a commit hash is matched to one of the IGNORE_HASHES it is not added to the
+commit map.
+
+``` py : <<get commit map>>=
+def commit_map_get(repository, path, start_commit):
+    <<git log for repository>>
+    lines = subprocess.check_output(command).split(b"\n")
+    commit_map = collections.OrderedDict()
+    for line in lines:
+        if line:
+            commit_sha, stamped_subject = line.split(b' ', 1)
+            stamp, subject = stamped_subject.split(b' ', 1)
+            subject = subject_strip(b"", subject).rstrip(b".")
+            stamped_subject = stamp + b" " + subject
+
+            if commit_sha in IGNORE_HASHES:
+                continue
+            commit_map[stamped_subject] = commit_sha
+    return commit_map
+```
+
+TBD: INCOMPLETE. Current Cycles standalone repository and missing commits don't
+agree much between each other. Especially the patch for the big Cycles X merge
+is causing trouble for git am and git apply.
+
+## Part II : generating .NET bindings
+
+To integrate the Cycles rendering engine into Rhinoceros 3D we need .NET
+bindings. These are created using the tool `ClangSharpPInvokeGenerator`.
+
+The tool can be used in combination with a response file to ensure command-line
+invocation doesn't go past the command-line length limit.
+
+Each element of the command-line invocation goes on a separate line. Options and
+paramaters, values to these are all separated by newline.
+
+With the response file the generator will be configured for code generation, how
+to parse the input. There will be also all the necessary defines that will be
+used to analyze the code. Finally the output will be configured. Here we can
+specify a text file whose content will be prepended to each file. This ensures
+all automatically generated files will have the necessary content.
+
+``` rsp : <<rsp file.*>>= ./configuration.rsp
+<<rsp generator configuration>>
+<<rsp cycles defines>>
+<<rsp cycles input files>>
+<<rsp output configuration>>
+```
+
+We will be generating bindings for all necessary parts. These are defined over
+many header files, and we want the generated bindings to reflect this. This is
+done with the `multi-file`.
+
+For code generation the target is the latest stable .NET version and C# version,
+which at the time of writing are .NET 5 and C# 9.0. To ensure that the argument
+`latest-codegen` is used.
+
+At the moment it is not clear what types should be generated. But since most of
+the work takes currently place on the Windows platform we specify
+`windows-types`.
+
+To understand where enums come from require that they are fully qualified, use
+`exclude-using-statics-for-enums`.
+
+All the generator configuration settings are given as arguments to the
+`--config` option.
+
+To help with identifying potential problems specify the logging
+settings `log-exclusions`, `log-potential-typedef-remappings` and
+`log-visited-files`.
+
+``` rsp : <<rsp generator configuration>>=
+--config
+latest-codegen
+windows-types
+exclude-using-statics-for-enums
+exclude-default-remappings
+exclude-anonymous-field-helpers
+exclude-fnptr-codegen
+exclude-enum-operators
+multi-file
+generate-tests-nunit
+generate-cpp-attributes
+log-exclusions
+log-potential-typedef-remappings
+log-visited-files
+--additional
+-ferror-limit=1000
+-Wc++17-extensions
+-std
+c++17
+--exclude
+ccl::TextureMapping::Mapping
+ccl::TextureMapping::Projection
+ccl::NodeMappingType
+ccl::DEVICE_MASK_ALL
+ccl::float4
+ccl::float3
+ccl::Transform
+Namespace
+LongDouble
+ClassTemplatePartialSpecialization
+error_code
+hash
+system_error
+__non_rtti_object
+std::__non_rtti_object
+string
+std::string
+default_error_condition
+--remap
+char*=string
+ccl::TextureMapping::Mapping=int
+ccl::TextureMapping::Projection=int
+ccl::NodeMappingType=int
+ccl::DEVICE_MASK_ALL=0
+ccl::float4=float*
+ccl::float3=float*
+ccl::Transform=float*
+```
+
+To parse Cycles headers correctly a set of defines has to be passed to the
+generator. These include the namespace defines `CCL_NAMESPACE_BEGIN` and
+`CCL_NAMESPACE_END`. For the API no other defines are needed.
+
+A few defines are given to suppress
+
+``` rsp : <<rsp cycles defines>>=
+--define-macro
+CCL_NAMESPACE_BEGIN=namespace ccl {
+CCL_NAMESPACE_END=}
+LOG(x)=
+_CRT_SECURE_NO_WARNINGS
+_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
+_MT
+```
+
+There are two pieces to be specified. Firstly the input files. We'll start with
+the files `session.h` and `device.h`. Secondly the include directories need to
+be specified so the generator can properly parse the input files.
+
+``` rsp : <<rsp cycles input files>>=
+--file
+D:/Dev/Rhino/rhino7/src4/rhino4/Plug-ins/RDK/cycles/ccycles/ccycles.h
+--include-directory
+D:/Dev/Rhino/rhino7/src4/rhino4/Plug-ins/RDK/cycles/ccycles/ccycles.h
+```
+
+In the generated files we want to use `ccl` as the namespace. Furthermore the
+files should be realized in the folder `Interop`. The generated tests go to
+`InteropTests`.
+``` rsp : <<rsp output configuration>>=
+--libraryPath
+ccycles.dll
+--namespace
+ccl
+--output
+./Interop
+--test-output
+./InteropTests
+```
+
+To run the `ClangSharpPInvokeGenerator` tool in PowerShell run as follows:
+
+ ``` ps
+ PS> ClangSharpPInvokeGenerator.exe "@configuration.rsp"
+ ```
+
+### Installing and updating ClangSharpPInvokeGenerator
+
+The tool is installed as a dotnet tool. This can be done as follows:
+
+``` ps
+PS> dotnet tool install --global ClangSharpPInvokeGenerator --version 12.0.0-beta1
+```
+
+To find out if a newer version is available use:
+
+``` ps
+PS> dotnet tool search --prerelease ClangSharpPInvokeGenerator
+```
+
+When a newer version is available use something like:
+
+``` ps
+PS> dotnet tool update --global ClangSharpPInvokeGenerator --version 12.0.0-beta2
+```
+
+but with the version number adapted to what the latest is at the time of
+checking.
+
+
+# Building Cycles
+
+There are several parts to getting Cycles built: dependencies and Cycles itself.
+
+A script for keeping the project files with which the Cycles source code is
+built has been created: `update_projectfiles.py`. This script lives under
+`$(RHINOROOT)/src4/tools/CyclesProjectUpdater`. This is expected to be run in
+that directory with a Python 3 interpreter:
+
+``` ps
+PS> cd $(RHINOROOT)/src4/tools/CyclesProjectUpdater
+PS> python update_projectfiles.py
+```
+
+## Building dependencies for Cycles
+
+Building of the dependencies for Cycles is automated through a Python script
+`build_cycles_packages.py`. Since we will be using this tool on multiple
+platforms we need to be able to determine which platform it is running on.
+Dependencies may need different settings and building procedures based on the
+platform. To that end we import the `platform` module.
+
+As a convenience variable lets here initializze `on_macos` since we are
+currently buildin on two platforms
+
+``` py : <<imports>>=
+import platform
+on_macos = platform.system()=='Darwin'
+```
+
+## TODO with Cycles dependencies building
+
+* Double-check and fixup RPATH issues. See [the cmake page on RPATH](https://gitlab.kitware.com/cmake/community/-/wikis/doc/cmake/RPATH-handling) as part of the investigation.
+    * OpenImageIO
+        * Ensure building and linking against correct libraries - not the ones already installed, but the ones created by this tool
+* Investigate building for Apple Silicon
+
+### The Package class
+
+Packages are expressed through instances of the `Package` class. For this script
+instances of the class shall be created through creator functions that are
+decorated with `@register_package`, which then will be added to the `packages`
+list.
+
+#### Registering packages
+
+
+``` py : <<register package decorator>>=
+def register_package(func : Callable[[None], Package]):
+    """Register package function"""
+    package = func()
+    packages.append(package)
+
+    return func
+```
+
+In the `register_package` signature the parameter is annotated with `Callable`, which comes from the `typing` module. Ensure it is imported
+
+``` py : <<imports>>=+
+from typing import Callable
+```
+
+Note that these imports all will be added to the `<<imports>>` fragment.
+
+#### Sorting packages
+
+To sort the package list a topological sort using [Kahn's
+algorithm](https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm)
+is applied.
+
+First a deep copy of each package instance in `packages`is created to ensure we
+don't mess up the `dependencies` list of each package while going through the
+algorithm. This copied list is available as `G`, which represents the graph in
+the algorithm explanation in the linked Wikipedia above. Since this will contain
+packages from which the dependencies are removed as they are identified and
+handled we will have the situation where at the end of the sorting any missing
+dependencies are still left in packages of that list `G`. This list will be
+checked in `<<check registration consistency>>`.
+
+``` py : <<sort packages>>=
+G = [copy.deepcopy(p) for p in packages]
+S = [copy.deepcopy(p) for p in G if len(p.dependencies)==0]
+for p in S:
+    p.dependencies = [d.lower() for d in p.dependencies]
+L : List[Package] = list()
+while len(S)>0:
+    n = S.pop(0)
+    L.append(n)
+    for m in G:
+        if n.name.lower() in m.dependencies:
+            m.dependencies.remove(n.name.lower())
+            if len(m.dependencies)==0:
+                S.append(m)
+
+_packages = {p.name: p for p in packages}
+packages = [_packages[p.name] for p in L]
+```
+
+The `deepcopy` method comes from the `copy` module. That we need to import
+
+``` py : <<imports>>=+
+import copy
+```
+
+#### Package declaration
+
+The `Package` class gives information on download URL, local download location,
+extract location, include directories and library directories provided by this
+package. Additionally packages that instantiate this class should pass in
+functions for patching, building and preparing final package. Packages should
+also provide a list the names of packages they depend on. The casing of the name
+does not matter, as long as the lower-cased version of it matches the
+lower-cased name of a package.
+
+`Package` is implemented as a `@dataclass`, along with slots.
+
+``` py : <<Package class>>=
+@dataclass
+class Package:
+    __slots__ = ["name", "version", "url", "local", "acquire", "get_include_dir",
+                 "get_library_dir", "patcher", "builder", "prepare_package",
+                 "dependencies", "extract_location"]
+    name : str
+    version : str
+    url : str
+    local : Path
+    acquire : Callable[..., None]
+    get_include_dir : Callable[..., str]
+    get_library_dir : Callable[..., str]
+    patcher : Callable[..., None]
+    builder : Callable[..., None]
+    prepare_package: Callable[..., None]
+    dependencies : List[str]
+    extract_location : str
+
+    def acquire_it(self):
+        if self.acquire:
+            return self.acquire(self)
+
+    def build_it(self):
+        if self.builder:
+            return self.builder(self)
+
+    def patch_it(self):
+        if self.patcher:
+            return self.patcher(self)
+```
+
+The `@dataclass` decorator is provided by the `dataclasses` module. The `List` annotation type is also needed, which is provided by the `typing` module. The module `pathlib` provides the `Path` type.
+
+``` py : <<imports>>=+
+from dataclasses import dataclass
+from typing import List
+from pathlib import Path
+```
+
+The script sets up a couple of variables like the download and build folders and
+handles parsing of the arguments. It provides the main structure for building.
+
+In `<<all packages>>` each package is defined and registered. As mentioned
+earlier, the `register_package` decorator will take care of sorting the package
+in the proper order for building, thus ensuring all dependencies are acquired
+and realized at the correct time.
+
+
+``` py : <<build cycles packages.*>>= ./build_cycles_packages.py
+<<imports>>
+import subprocess
+
+<<Package class>>
+
+# will gather all the different packages that exist.
+packages : List[Package] = list()
+
+<<register package decorator>>
+
+<<no patches>>
+
+msbuild = Path(r'C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\MSBuild\Current\Bin\MSBuild.exe')
+
+current_path = Path('.').resolve()
+dl_folder = current_path / '..' / 'cycles_dependencies_dl'
+dl_folder = dl_folder.resolve()
+build_folder = current_path / '..' / 'cycles_dependencies_build'
+build_folder = build_folder.resolve()
+
+<<parse command-line arguments>>
+
+<<url download progress>>
+
+<<recursive folder content delete>>
+
+<<download and extract package>>
+
+if args.clean_dl:
+    if dl_folder.exists():
+        print(f"Cleaning out {dl_folder}...")
+        folder_recursive_delete(dl_folder)
+        print("... clean complete.")
+    dl_folder.mkdir()
+else:
+    if not dl_folder.exists():
+        dl_folder.mkdir()
+    print("Not cleaning out old download results")
+
+if args.clean_build:
+    if build_folder.exists():
+        print(f"Cleaning out {build_folder}...")
+        folder_recursive_delete(build_folder)
+        print("... clean complete.")
+    build_folder.mkdir()
+else:
+    if not build_folder.exists():
+        build_folder.mkdir()
+    print("Not cleaning out build results")
+
+<<all packages>>
+
+<<sort packages>>
+
+<<check registration consistency>>
+
+for package in packages:
+    print(f"Fetching {package.name}...")
+    package.acquire_it()
+    print(f"Patching {package.name}...")
+    package.patch_it()
+    print(f"Building {package.name}...")
+    package.build_it()
+    print(f"{package.name} ready")
+
+```
+
+The script understands command-line arguments for control of the flow. For argument parsing bring in the correct module
+
+``` py : <<imports>>=+
+import argparse
+```
+
+Then set up the argument parsing and add all the arguments we want. The cleaning out of downloads is handled with `--clean_dl`. It is defined with action `BooleanOptionalAction`, which allows the user to specify on the command-line `--no-clean_dl` to prevent the download folder from being cleaned out.
+
+Cleaning of the `build_folder` is controlled with `--clean_build`.
+
+``` py : <<parse command-line arguments>>=
+parser = argparse.ArgumentParser()
+parser.add_argument('--clean-dl', action=argparse.BooleanOptionalAction, default=True)
+parser.add_argument('--clean-build', action=argparse.BooleanOptionalAction, default=True)
+
+args = parser.parse_args()
+```
+
+#### Ensuring package registry consistency
+
+Before the register packages can be handled the script must check whether all
+depencies have been met. Since we have just sorted the package list in such a
+way that the validity of the sort wasn't checked we can do that now. In the `G`
+list we have all the packages that were visited during the sort. If there are
+any packages left that have still dependencies in their list we know those
+dependencies are the ones missing. We can thus print out the name of any
+offending package and the missing dependencies it declared.
+
+``` py : <<check registration consistency>>=
+incomplete_packages = [p for p in G if len(p.dependencies)>0]
+if len(incomplete_packages)>0:
+    print("The following packages have missing dependencies:")
+    for ip in incomplete_packages:
+        print(f"{ip.name} - {ip.dependencies!r}")
+    sys.exit(13)
+```
+
+For early exiting the script with an error code (13) we use `sys.exit`. To that end
+the `sys` module needs to be imported.
+
+``` py : <<imports>>=+
+import sys
+```
+
+The downloads are placed in a temporary subfolder `dl` in the containing folder
+of the packages script. The folder is created if it does not exist yet. If
+it does exist already its contents are deleted to ensure no old downloads or
+builds interfere with the process.
+
+Extracting and building is done to a temporary subfolder `build` next to `dl`.
+The folder is also created if it does not exist yet. As with the download folder
+contents are deleted if the build folder already exists.
+
+To clean out a location the `folder_recursive_delete` from `<<recursive folder
+content delete>>` is used.
+
+``` py : <<recursive folder content delete>>=
+def folder_recursive_delete(folder : Path) -> None:
+    if not folder.exists() or not folder.is_dir():
+        return
+    for child in folder.iterdir():
+        if child.is_dir():
+            folder_recursive_delete(child)
+        else:
+            child.unlink()
+    folder.rmdir()
+```
+
+#### Downloading packages
+
+A download progress reporter function is defined to allow us to show progress
+during a download. This is important since a download may take a long while, and
+without any notification it can be hard to determine if the script should maybe
+restarted.
+
+``` py : <<url download progress>>=
+def download_progress_reporter(block_count : int, block_size_in_bytes : int, total_size : int) -> None:
+    if total_size > -1:
+        perc = block_count * block_size_in_bytes / total_size * 100
+        print(f"{block_count * block_size_in_bytes} bytes ({perc:.1f}%) downloaded of {total_size}\r", end="")
+    else:
+        perc = "~"
+        print(f"{block_count * block_size_in_bytes} bytes downloaded (total size unknown)\r", end="")
+```
+
+Downloading and extracting of a package is handled with `<<download and
+extract package>>`. Source archives are downloaded to the `dl_folder` and
+subsequently extracted to `build_folder`. If the archive already exists assume
+no downloading needed.
+
+``` py : <<download and extract package>>=
+def download_and_extract_package(package : Package) -> None:
+    dep_local = package.local
+    dep_url = package.url
+    if not dep_local.exists():
+        #print(f"Start downloading {package.name} {package.version}...")
+        dep_local_zip, httpmessage = urllib.request.urlretrieve(dep_url, str(dep_local), download_progress_reporter)
+        #print(f"...download to {dep_local} complete.")
+        print(f"Extracting {package.name}...")
+        dep_local_zip = Path(dep_local_zip)
+        if dep_local != dep_local_zip:
+            print(f"Archive download location different from specified")
+    else:
+        print(f"{package.name} ({dep_url}) already downloaded as {dep_local}.")
+
+    if dep_local and dep_local.exists():
+        def extract_only_when_necessary(archive : Union[zipfile.ZipFile, tarfile.TarFile], local_path : Path, target_path : Path, extracted_location : Path) -> None:
+            if not extracted_location.exists():
+                print(f"extracting {local_path}...")
+                archive.extractall(target_path)
+                print(f"... extracting {local_path} complete.")
+            else:
+                print(f"Archive {local_path} already extracted.")
+
+        def extract_archive(archive : Union[zipfile.ZipFile, tarfile.TarFile]):
+            if type(archive) == zipfile.ZipFile:
+                root = zipfile.Path(archive)
+                children = [p for p in root.iterdir()]
+                if len(children)==1 and children[0].is_dir():
+                    package.extract_location = build_folder / children[0].name
+                    target_folder = build_folder
+                else:
+                    stem = dep_local.stem
+                    target_folder = build_folder / stem
+                    package.extract_location = target_folder
+            else:
+                if archive.getmembers()[0].isdir():
+                    target_folder = build_folder
+                    package.extract_location = target_folder / archive.getmembers()[0].name
+                else:
+                    stem = dep_local.stem
+                    target_folder = build_folder / stem
+                    package.extract_location = target_folder
+
+            extract_only_when_necessary(archive, dep_local, target_folder, package.extract_location)
+
+        if dep_local.suffix == '.zip':
+            with zipfile.ZipFile(dep_local, mode='r') as dep_zip:
+                extract_archive(dep_zip)
+        else:
+            with tarfile.open(name=dep_local, mode='r:gz') as dep_zip:
+                extract_archive(dep_zip)
+
+```
+
+When the `dep_local` exists determine the top level element
+
+Downloading and extracting the source archives use the `urllib.request`,
+`tarfile` and `zipfile` modules. For the type hinting with choice between
+parameter types we use `Union`, so lets import that too.
+
+``` py : <<imports>>=+
+import urllib.request
+import tarfile
+import zipfile
+from typing import Union
+```
+
+#### Default no-op patcher
+
+If a package does not require any patching the creation of the package instance
+can use the `no_patches` function instead of having to provide a custom function
+for the patching.
+
+``` py : <<no patches>>=
+def no_patches(self : Package):
+    print(f"No patches for {self.name}")
+```
+
+#### All Packages
+
+As mentioned earlier, all packages need to be defined and registered properly.
+That is done in `<<all packages>>`. The order of definition does not matter, as
+each package has to express what other packages it depends on. The script will
+automatically create the correct build order through the `register_package`
+decorator.
+
+``` py : <<all packages>>=
+<<Boost package>>
+
+<<OpenEXR package>>
+
+<<OpenImageIO package>>
+
+<<zlib package>>
+
+<<libpng package>>
+
+<<embree package>>
+
+<<libtiff package>>
+
+<<libjpeg package>>
+```
+
+
+### Building boost
+
+The Boost version used is
+``` py : <<Boost version>>=
+boost_version = '1.77.0'
+boost_version_ = boost_version.replace('.', '_')
+```
+
+With the Boost version we can determine the correct download location
+
+``` py : <<Boost download location>>=
+boost_url = f'https://boostorg.jfrog.io/artifactory/main/release/{boost_version}/source/boost_{boost_version_}.zip'
+```
+
+Download the Boost archive and extract it. The file will be downloaded to the
+dl_folder. After downloading its content is extracted to the `build_folder`.
+Since the ZIP file top member is a folder there is no need to specify a separate
+sub-folder under `build_folder`.
+
+#### The boost builder
+
+To build boost it needs to be bootstrapped with the `bootstrap` script. After
+the bootstrapping has been completed the proper version can be built with `b2`.
+
+Building will be done to `boost_build` under `build_folder`.
+
+On MacOS the `bootstrap` and `build.sh` scripts needs to have its permissions
+set so that it can be executed.
+
+``` py : <<boost builder>>=
+def boost_build(self) -> None:
+    already_built = build_folder / 'boost.built'
+
+    boost_install = self.extract_location / '..' / 'boost_install'
+    if not already_built.exists():
+        if boost_install.exists():
+            folder_recursive_delete(boost_install)
+        boost_install.mkdir()
+
+        if not on_macos:
+            bootstrap = [f"{self.extract_location / 'bootstrap.bat' }"]
+            b2exe = f"{self.extract_location / 'b2.exe' }"
+            toolsets = ['14.1', '14.2']
+        else:
+            bootstrap = [f"{self.extract_location / 'bootstrap.sh' }"]
+            buildsh = f"{self.extract_location / 'tools/build/src/engine/build.sh' }"
+            b2exe = f"{self.extract_location / 'b2' }"
+            chmod_process = subprocess.run(['chmod', 'u+x', bootstrap[0], buildsh])
+            if chmod_process.returncode!=0:
+                print("Could not change bootstrap.sh permissions.")
+                raise Exception("Problem setting bootstrap.sh permissions.")
+            toolsets = ['clang']
+
+        print("Bootstrapping Boost... ")
+        bootstrap_process = subprocess.run(bootstrap, cwd=self.extract_location, capture_output=True)
+        if bootstrap_process.returncode!=0:
+            print("Problem bootstrapping Boost:")
+            print(f"{bootstrap_process.stdout}")
+            print(f"{bootstrap_process.stderr}")
+            raise Exception("Problem bootstrapping Boost.")
+        print("Bootstrapping Boost complete.")
+
+
+        variants = ['release', 'debug']
+        for toolset in toolsets:
+            for variant in variants:
+                boost_build = self.extract_location / '..' / f'boost_build{variant}'
+                boost_stage = self.extract_location / '..' / f'boost_stage{variant}'
+                if boost_build.exists():
+                    folder_recursive_delete(boost_build)
+                boost_build.mkdir()
+                if boost_stage.exists():
+                    folder_recursive_delete(boost_stage)
+                boost_stage.mkdir()
+
+                boostbuild= [
+                    b2exe,
+                    "-d+2",
+                    "-q",
+                    f"--prefix={boost_install}",
+                    "--no-cmake-config",
+                    f"--stagedir={boost_stage}",
+                    "--build-type=minimal",
+                    f"--build-dir={boost_build}",
+                    "--layout=tagged",
+                    f"--buildid=RH-{toolset.replace('.', '')}" if on_macos else f"--buildid=RH-v{toolset.replace('.', '')}",
+                    f"variant={variant}",
+                    "warnings=off",
+                    f"toolset={toolset}" if on_macos else f"toolset=msvc-{toolset}",
+                    "link=shared",
+                    "threading=multi",
+                    "runtime-link=shared",
+                    "address-model=64",
+                    "--with-date_time",
+                    "--with-chrono",
+                    "--with-filesystem",
+                    "--with-locale",
+                    "--with-regex",
+                    "--with-system",
+                    "--with-thread",
+                    "--with-serialization",
+                    "stage",
+                    "install"
+                ]
+
+                print(f"Building Boost: {toolset}, {variant}... ")
+                boostbuild_process = subprocess.run(boostbuild, cwd=self.extract_location, capture_output=True)
+                if boostbuild_process.returncode!=0:
+                    print(f"Problem building Boost, {toolset}, {variant}:")
+                    print(f"{boostbuild_process.stdout}")
+                    print(f"{boostbuild_process.stderr}")
+                    raise Exception(f"Problem building Boost. {toolset}, {variant}")
+                print(f"Building Boost complete. {toolset}, {variant}")
+        already_built.touch()
+```
+
+``` py : <<Boost package>>=
+@register_package
+def boost():
+    <<Boost version>>
+    <<Boost download location>>
+    def boost_include_dir(self) -> str:
+        boost_inc = self.extract_location / '..' / 'boost_install' / 'include'
+        boost_inc = boost_inc.resolve()
+        return f"{boost_inc}"
+
+    def boost_library_dir(self) -> str:
+        boost_lib = (self.extract_location / '..' / 'boost_install' / 'lib').resolve()
+        return f"{boost_lib}"
+
+    def boost_package(self) -> None:
+        pass
+
+    <<boost builder>>
+
+    boost_local = dl_folder / f'boost_{boost_version_}.zip'
+
+    boost_dep = Package("Boost", boost_version, boost_url, boost_local,
+                            download_and_extract_package,
+                            boost_include_dir, boost_library_dir, no_patches,
+                            boost_build, boost_package,
+                            [], '')
+    return boost_dep
+```
+
+### Building OpenEXR
+
+The version of OpenEXR needed is
+
+``` py : <<OpenEXR version>>=
+openexr_version = '2.5.5'
+```
+
+The location from where the OpenEXR source archive is download is
+
+``` py : <<OpenEXR download location>>=
+openexr_url = f'https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v{openexr_version}.zip'
+```
+
+The OpenEXR archive is extracted to the `build_folder`. There are no patches to
+be applied, so we can concentrate on just configuring and building OpenEXR. From
+OpenEXR 2.5 onward the library is split up into separate parts: `IlmBase`,
+`OpenEXR` and `PyIlmBase`. We don't need the Python bindings, therefor we pass
+to `cmake` the setting `-DPYILMBASE_ENABLE=OFF`.
+
+We also want to prevent clashes with other software that may use OpenEXR. To
+that end we use a custom library prefix `-RH-2_5` instead of the regular `-2_5`.
+This should ensure ability to load Rhino inside software that happen to be using
+the same library but from a different location.
+
+Since for `cmake` projects it is good practice to build and install outside of
+the source directory we will use two folders, `openexr_build` and
+`openexr_install` for this. These are created in the `build_folder` for this
+run.
+
+To build OpenEXR the zlib linking library and include directory are needed as
+well, so ensure we fetch those and pass them along on the `cmake` command-line.
+
+``` py : <<openexr builder>>=
+def openexr_build(self) -> None:
+    already_built = build_folder / 'openexr.built'
+    # we shouldn't build in the source directory (extract_location)
+    build_dir = Path(self.extract_location) / '..' / 'openexr_build'
+    install_dir = Path(self.extract_location) / '..' / 'openexr_install'
+
+    if not already_built.exists():
+        if build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        if install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        for p in packages:
+            if p.name.lower() == 'zlib':
+                zlib_library = Path(p.get_library_dir(p))
+                zlib_include_dir = Path(p.get_include_dir(p))
+
+        openexr_config_cmake = [
+            'cmake',
+            f'-DCMAKE_SYSTEM_PREFIX={install_dir}',
+            f'-DCMAKE_INSTALL_PREFIX={install_dir}',
+            '-DOPENEXR_LIB_SUFFIX=-RH-2_5',
+            '-DILMBASE_LIB_SUFFIX=-RH-2_5',
+            f'-DZLIB_LIBRARY={zlib_library}',
+            f'-DZLIB_INCLUDE_DIR={zlib_include_dir}',
+            '-DPYILMBASE_ENABLE=OFF',
+            f"{self.extract_location}"
+        ]
+
+        print("Configuring OpenEXR")
+        openexr_config_process = subprocess.run(openexr_config_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if openexr_config_process.returncode!=0:
+            print(openexr_config_process.stdout)
+            print(openexr_config_process.stderr)
+            raise Exception("OpenEXR configuration failed")
+
+        print("OpenEXR configured.")
+
+        openexr_build_cmake = [
+            'cmake',
+            '--build',
+            '.',
+            '--target',
+            'install',
+            '--config',
+            'Release'
+        ]
+        print("Building OpenEXR")
+        openexr_build_process = subprocess.run(openexr_build_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if openexr_build_process.returncode!=0:
+            print(openexr_build_process.stdout)
+            print(openexr_build_process.stderr)
+            raise Exception("OpenEXR build failed")
+
+        print("OpenEXR built.")
+
+        already_built.touch()
+```
+
+``` py : <<OpenEXR package>>=
+def openexr_include_dir(self) -> str:
+    install_dir = (self.extract_location / '..' / 'openexr_install' / 'include').resolve()
+    return f"{install_dir}"
+
+def openexr_library_dir(self) -> str:
+    return ""
+
+def openexr_package(self) -> None:
+    pass
+
+<<openexr builder>>
+@register_package
+def openexr():
+    <<OpenEXR version>>
+    <<OpenEXR download location>>
+    openexr_local = dl_folder / f'openexr_{openexr_version}.zip'
+    openexr_dep = Package("OpenEXR", openexr_version, openexr_url, openexr_local,
+                            download_and_extract_package,
+                            openexr_include_dir, openexr_library_dir, no_patches,
+                            openexr_build, openexr_package,
+                            ['zlib'], '')
+    return openexr_dep
+```
+
+### Building  OpenImageIO
+
+``` py : <<oiio version>>=
+oiio_version = '2.2.19.0'
+```
+
+The download location of oiio is
+
+``` py : <<oiio download location>>=
+oiio_url = f'https://github.com/OpenImageIO/oiio/archive/refs/tags/v{oiio_version}.zip'
+```
+
+The `oiio` library
+
+``` py : <<OpenImageIO package>>=
+def oiio_include_dir(self) -> str:
+    return f"{self.extract_location}"
+
+def oiio_library_dir(self) -> str:
+    return f"{self.extract_location}"
+
+def oiio_package(self) -> None:
+    pass
+
+<<oiio builder>>
+
+@register_package
+def oiio():
+    <<oiio version>>
+    <<oiio download location>>
+    oiio_local = dl_folder / f'OpenImageIOv{oiio_version}.zip'
+    oiio_dep = Package("OpenImageIO", oiio_version, oiio_url, oiio_local,
+                            download_and_extract_package,
+                            oiio_include_dir, oiio_library_dir, no_patches,
+                            oiio_build, oiio_package,
+                            ["openexr", "boost", "libpng", "libtiff", "libjpeg"], '')
+    return oiio_dep
+```
+
+#### OpenImageIO builder
+
+The actual building of `oiio` is handled in `<<oiio builder>>`. The build starts
+by configuring the project with CMake. Once the configuration is complete CMake
+is used to guide the actual build process.
+
+Building and distribution preparation are done outside of the source folder.
+This is done by creating `build_dir` and `install_dir` variables that hold the
+correct locations.
+
+**TODO**: Add way to get version number from package.
+
+``` py : <<oiio builder>>=
+def oiio_build(self) -> None:
+    already_built = build_folder / 'oiio.built'
+    build_dir = self.extract_location / '..' / 'oiio_build'
+    install_dir = self.extract_location / '..' / 'oiio_install'
+
+    if not already_built.exists():
+        if build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        if install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        <<gather oiio dependencies>>
+        <<configure oiio with cmake>>
+
+        oiio_build_cmake = [
+            'cmake',
+            '--build',
+            '.',
+            '--target',
+            'install',
+            '--config',
+            'Release'
+        ]
+        oiio_build_process = subprocess.run(oiio_build_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if oiio_build_process.returncode!=0:
+            print(oiio_build_process.stdout)
+            print(oiio_build_process.stderr)
+            raise Exception("OpenImageIO build failed")
+        else:
+            print("OpenImageIO built")
+
+        already_built.touch()
+```
+
+#### OpenImageIO dependencies
+
+The OpenImageIO library is built against dependencies managed by this script.To
+ensure these are used properly we need to harvest all necessary data to pass on
+to the CMake configuration step.
+
+The Zlib, libTIFF, libJPEG and OpenEXR dependencies don't need special care, as for those we can directly ask each respective package for the library and root paths.
+
+The Boost dependency, however, needs some extra attention.
+
+``` python : <<gather oiio dependencies>>=
+for p in packages:
+    if p.name.lower() == 'zlib':
+        zlib_library = p.get_library_dir(p)
+        zlib_root = p.get_include_dir(p)
+    if p.name.lower() == 'libtiff':
+        libtiff_include = p.get_include_dir(p)
+        libtiff_root = (Path(libtiff_include) / '..') .resolve()
+    if p.name.lower() == 'openexr':
+        openexr_root = (Path(p.get_include_dir(p)) / '..' ) .resolve()
+    if p.name.lower() == 'libjpeg':
+        libjpeg_include = p.get_include_dir(p)
+        libjpeg_root = (Path(libjpeg_include) / '..' ) .resolve()
+    <<boost for oiio>>
+```
+
+##### Boost dependency
+
+OpenImageIO needs Boost. We need the location of the linking libraries and the
+headers. The libraries linked against on Windows have in their name the toolset
+`v142` and end in `.lib`. In contrast on MacOS the toolset is `clang`, the
+library names are prefixed with `lib` and end in `.dylib`.
+
+Remember from the Boost configuration section that we tag our builds of the
+libraries with 'RH'.
+
+``` python : <<boost for oiio>>=
+if p.name.lower() == 'boost':
+    boost_library_dir = p.get_library_dir(p)
+    boost_include_dir = p.get_include_dir(p)
+    boost_root = Path(boost_include_dir) / '..'
+    boost_root = boost_root.resolve()
+    if on_macos:
+        prefix = 'lib'
+        postfix = 'clang.dylib'
+    else:
+        prefix = ''
+        postfix = 'v141.lib'
+
+    _boost_libraries = [
+        'boost_atomic-mt-x64-RH-',
+        'boost_chrono-mt-x64-RH-',
+        'boost_date_time-mt-x64-RH-',
+        'boost_filesystem-mt-x64-RH-',
+        'boost_locale-mt-x64-RH-',
+        'boost_regex-mt-x64-RH-',
+        'boost_serialization-mt-x64-RH-',
+        'boost_system-mt-x64-RH-',
+        'boost_thread-mt-x64-RH-',
+        'boost_wserialization-mt-x64-RH-'
+    ]
+    boost_libraries = ';'.join([f'{prefix}{lib}{postfix}' for lib in _boost_libraries])
+```
+
+#### Configuring OpenImageIO with CMake
+
+To ensure OpenImageIO is not built with support for dependencies we haven't
+built ourselves we need to explicitly disable everything else. This is
+especially important on MacOS systems, since it is easy to have potential
+dependencies installed through `homebrew`.
+
+``` python : <<explicitly turned off oiio features>>=
+'-DUSE_PTHREAD=OFF',
+'-DUSE_PYTHON=OFF',
+'-DUSE_CCACHE=OFF',
+'-DOIIO_BUILD_TOOLS=OFF',
+'-DOIIO_BUILD_TESTS=OFF',
+'-DBUILD_TESTING=OFF',
+'-DBUILD_DOCS=OFF',
+'-DBUILD_FMT_FORCE=OFF',
+'-DBUILD_MISSING_DEPS=OFF',
+'-DINSTALL_DOCS=OFF',
+'-DINSTALL_FONTS=OFF',
+'-DOIIO_THREAD_ALLOW_DCLP=OFF',
+'-DENABLE_GIF=OFF',
+'-DENABLE_BZIP2=OFF',
+'-DENABLE_FREETYPE=OFF',
+'-DENABLE_HDF5=OFF',
+'-DENABLE_LIBHEIF=OFF',
+'-DENABLE_LibRaw=OFF',
+'-DENABLE_OPENGL=OFF',
+'-DENABLE_OPENGL_gl=OFF',
+'-DENABLE_OPENGL_glu=OFF',
+'-DENABLE_OPENJPEG=OFF',
+'-DENABLE_OpenCV=OFF',
+'-DENABLE_Ptex=OFF',
+'-DENABLE_Qt5=OFF',
+'-DENABLE_LBSQUISH=OFF',
+'-DENABLE_NUKE_DOIMAGE=OFF',
+'-DENABLE_WEBP=OFF',
+```
+
+**Note** Always check the resulting OpenImageIO libraries with dependency walker
+on Windows and with `otool -L` on MacOS what the built in dependencies are.
+Especially after updating OpenImageIO source code to a newer version great care
+must be taken no new unnoticed dependencies get pulled in.
+
+``` python : <<configure oiio with cmake>>=
+oiio_config_cmake = [
+    'cmake',
+    '-DCMAKE_VERBOSE_MAKEFILE=ON',
+    f'-DCMAKE_SYSTEM_PREFIX={install_dir}',
+    f'-DCMAKE_INSTALL_PREFIX={install_dir}',
+    <<explicitly turned off oiio features>>
+    '-DOIIO_LIBNAME_SUFFIX=RH',
+    '-DLINKSTATIC=ON',
+    f'-DZLIB_ROOT={zlib_root}',
+    f'-DZLIB_LIBRARY_DEBUG={zlib_library}',
+    f'-DZLIB_LIBRARY_RELEASE={zlib_library}',
+    f'-DBoost_ROOT={boost_root}',
+    '-DBOOST_CUSTOM=ON',
+    '-DBoost_VERSION=1.77',
+    f'-DBoost_INCLUDE_DIRS={boost_include_dir}',
+    f'-DBoost_LIBRARY_DIRS={boost_library_dir}',
+    f'-DBoost_LIBRARIES={boost_libraries}',
+    f'-DOpenEXR_ROOT={openexr_root}',
+    f'-DTIFF_ROOT={libtiff_root}',
+    f'-DJPEG_INCLUDE_DIR={libjpeg_include}',
+    f'-DJPEG_ROOT={libjpeg_root}',
+    f"{self.extract_location}"
+]
+
+print(oiio_config_cmake)
+
+oiio_config_process = subprocess.run(oiio_config_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+if oiio_config_process.returncode!=0:
+    print(oiio_config_process.stdout)
+    print(oiio_config_process.stderr)
+    raise Exception("OpenImageIO configuration failed")
+else:
+    print("OpenImageIO configured.")
+```
+
+
+### Building zlib
+
+The zlib version used is
+
+``` py : <<zlib version>>=
+zlib_version = '1.2.11'
+zlib_version_n = zlib_version.replace('.', '')
+```
+
+The download location of zlib is
+
+``` py : <<zlib download location>>=
+zlib_url = f'https://www.zlib.net/zlib{zlib_version_n}.zip'
+```
+
+The `zlib` library
+
+``` py : <<zlib package>>=
+def zlib_include_dir(self) -> str:
+    return f"{self.extract_location}"
+
+def zlib_library_dir(self) -> str:
+    if on_macos:
+        return f"{Path(self.extract_location) / 'libz.a'}"
+    else:
+        return f"{Path(self.extract_location) / 'contrib' / 'vstudio' / 'vc14' / 'x64' / 'ZlibStatRelease' / 'zlibstat.lib'}"
+
+def zlib_package(self) -> None:
+    pass
+
+<<zlib patcher>>
+
+<<zlib windows builder>>
+
+<<zlib macos builder>>
+
+<<zlib builder>>
+
+@register_package
+def zlib():
+    <<zlib version>>
+    <<zlib download location>>
+    zlib_local = dl_folder / f'zlib_{zlib_version}.zip'
+    zlib_dep = Package("zlib", zlib_version, zlib_url, zlib_local,
+                            download_and_extract_package,
+                            zlib_include_dir, zlib_library_dir, zlib_patch,
+                            zlib_build, zlib_package,
+                            [], '')
+    return zlib_dep
+```
+
+#### Patching zlib
+
+To be able to build `zlib` on Windows the source archive needs to be patched.
+This is for the project files. The source archive provides for vs14, but we use
+vs16. On MacOS the source code does not need patching.
+
+``` py : <<zlib patcher>>=
+def zlib_patch(self):
+    if on_macos:
+        return
+
+    patch_file = current_path / 'patches' / 'zlib_build_system.patch'
+    patch_file_applied = build_folder / 'zlib_build_system.patch.applied'
+
+    if not patch_file_applied.exists():
+        patch_command = [
+            'git',
+            'apply',
+            '--ignore-space-change',
+            '--ignore-whitespace',
+            '--whitespace=nowarn',
+            '-p1',
+            f"{patch_file}"
+        ]
+        patch_process = subprocess.run(patch_command, cwd=self.extract_location, encoding='utf-8', universal_newlines='\n', capture_output=True)
+        if patch_process.returncode!=0:
+            print(patch_process.stderr)
+            print(patch_process.stdout)
+            raise Exception("Zlib patching failed.")
+        print(patch_process.stdout)
+        patch_file_applied.touch()
+        print("Zlib patch successfully applied.")
+    else:
+        print("Zlib patch already applied.")
+```
+
+#### Building it
+
+The `zlib` library needs to built in two distinct ways on the supported
+platforms. The build logic is handled in `zlib_build_macos()` and
+`zlib_build_windows()` methods that are defined in the fragments `<<zlib macos
+builder>>` and `<<zlib windows builder>>` respectively.
+
+``` py : <<zlib builder>>=
+def zlib_build(self) -> None:
+    print("="*20)
+    print(f"\nBuilding {self.name}")
+    print(f"For {self.name} extract location: {self.extract_location}")
+
+    if on_macos:
+        zlib_build_macos(self)
+    else:
+        zlib_build_windows(self)
+```
+
+##### Building on Windows
+
+The actual building of `zlib` is handled in `<<zlib builder>>`. The build solution needed is under `{extract_location}/contrib/vstudio/vc14`. The project we want to build is for the static library of zlib, `zlibstat`. Configuration will be `x64`.
+
+There are two functions implemented in assembly, so these need to be built
+first. The batch file `bld_ml64.bat` will do that. Ensure that you have access
+to MASM (`ml64.exe`).
+
+``` py : <<zlib windows builder>>=
+def zlib_build_windows(self) -> None:
+    already_built = build_folder / 'zlib.built'
+
+    if not already_built.exists():
+        asmcode = self.extract_location / 'contrib' / 'masmx64' / 'bld_ml64.bat'
+        asmcode_wd = asmcode.parent
+        sln = self.extract_location / 'contrib' / 'vstudio' / 'vc14' / 'zlibvc.sln'
+
+        build_settings = [f"{msbuild}",
+                        f"{sln}",
+                        "/t:zlibstat",
+                        "/p:Configuration=Release",
+                        "/p:Platform=x64",
+                        "/m"
+        ]
+
+        print(build_settings)
+
+        asm_process = subprocess.run([f"{asmcode}"], cwd=f"{asmcode_wd}", encoding='utf-8', universal_newlines='\n', capture_output=True)
+        print(asm_process.stdout)
+
+        completed_process = subprocess.run(build_settings, encoding='utf-8', universal_newlines='\n', capture_output=True)
+        print(completed_process.stdout)
+
+
+        print(f"Use {sln}, {sln.exists()}")
+        already_built.touch()
+
+```
+
+##### Building on MacOS
+
+On MacOS first the `configure` script needs to be run. The `zlib` library is
+needed as a static library, and built for 64-bit architecture. This is done with
+the options `--static` and `--64` respectively.
+
+To be able to run the `configure` script it needs to be given the correct
+permissions which is done through executing `chmod u+x` on it.
+
+Once the configuration is complete the library can be built using `make`.
+
+``` py : <<zlib macos builder>>=
+def zlib_build_macos(self) -> None:
+    already_built = build_folder / 'zlib.built'
+
+    if not already_built.exists():
+        configure = self.extract_location / 'configure'
+
+        build_settings = [f"{configure}",
+                        "--static",
+                        "--64"
+        ]
+
+        print(build_settings)
+
+        chmod_process = subprocess.run(['chmod', 'u+x', configure], cwd=f"{self.extract_location}", encoding='utf-8', universal_newlines='\n', capture_output=True)
+
+        configure_process = subprocess.run(build_settings, cwd=f"{self.extract_location}", encoding='utf-8', universal_newlines='\n', capture_output=True)
+        print(configure_process.stdout)
+
+        make_process = subprocess.run(['make'], cwd=f"{self.extract_location}", encoding='utf-8', universal_newlines='\n', capture_output=True)
+        print(make_process.stdout)
+
+        already_built.touch()
+
+```
+
+### Building libpng
+
+The libpng version used is
+
+``` py : <<libpng version>>=
+libpng_version = '1.6.37'
+libpng_version_n = libpng_version.replace('.', '')
+```
+
+The download location of libpng is
+
+``` py : <<libpng download location>>=
+#libpng_url = f'https://downloads.sourceforge.net/project/libpng/libpng16/1.6.37/lpng1637.zip?ts=gAAAAABhcdxHiIQEppu8-oHTz9BTr3p2tJM_DeS4-wTGyGlS-kXzOZEPyiS_chMS85CqLLmKuoeYL0KiRykk2btl3edJf2E_tw%3D%3D&r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Flibpng%2Ffiles%2Flibpng16%2F1.6.37%2Flpng1637.zip%2Fdownload%3Fuse_mirror%3Daltushost-swe'
+
+libpng_url = 'https://downloads.sourceforge.net/project/libpng/libpng16/1.6.37/libpng-1.6.37.tar.gz?ts=gAAAAABhvF0oil3-kb0cblcm84Gl5XI3czxVE87TaeARn56PerrRwPViMRERvr8KKWSi88uy4gmoj9J6ZolV4oQw8CQSDfIf5Q%3D%3D&r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Flibpng%2Ffiles%2Flibpng16%2F1.6.37%2Flibpng-1.6.37.tar.gz%2Fdownload'
+```
+
+A small patch to the build system needs to be applied before we can build the `libpng` library. There is really only one change needed: setting the correct path to the `zlib` location.
+
+``` py : <<libpng patcher>>=
+def libpng_patch(self):
+    patch_file = current_path / 'patches' / 'lpng_build_system.patch'
+    patch_file_applied = build_folder / 'lpng_build_system.patch.applied'
+
+    if not patch_file_applied.exists():
+        patch_command = [
+            'git',
+            'apply',
+            '--ignore-space-change',
+            '--ignore-whitespace',
+            '--whitespace=nowarn',
+            '-p1',
+            f"{patch_file}"
+        ]
+
+        patch_process = subprocess.run(patch_command, cwd=self.extract_location, encoding='utf-8', universal_newlines='\n', capture_output=True)
+        if patch_process.returncode!=0:
+            print(patch_process.stdout)
+            raise Exception("Could not patch PNG")
+        else:
+            print("LibPNG patched.")
+        patch_file_applied.touch()
+    else:
+        print("LibPNG already patched.")
+```
+
+#### The libpng builder
+
+Building the `libPNG` library on both MacOS and Windows require sufficiently
+different approaches that it is split over two specialized buid functions, which
+are presented by `<<libpng macos builder>>` and `<<libpng windows builder>>` respectively.
+
+``` py : <<libpng builder>>=
+def libpng_build(self) -> None:
+    print("="*20)
+    print(f"\nBuilding {self.name}")
+    print(f"For {self.name} extract location: {self.extract_location}")
+
+    if on_macos:
+        libpng_macos_build(self)
+    else:
+        libpng_windows_build(self)
+
+```
+
+##### LibPNG MacOS builder
+
+On MacOS building of `libPNG` is controlled through CMake. As an additional
+hurdle the files contained in the archive are DOS-style in such a way that it
+actually causes problems. To that end we need to run `dos2unix` on all extracted
+files of the library archive.
+
+``` py : <<libpng macos builder>>=
+def libpng_macos_build(self) -> None:
+    already_built = build_folder / 'libpng.built'
+    print("="*20)
+    print(f"\nBuilding {self.name}")
+    print(f"For {self.name} extract location: {self.extract_location}")
+    build_dir = self.extract_location / '..' / 'libpng_build'
+    install_dir = self.extract_location / '..' / 'libpng_install'
+
+    if not already_built.exists():
+        """dos2unix = [
+            "find",
+            ".",
+            "-type",
+            "f",
+            "|",
+            "xargs",
+            "dos2unix"
+        ]
+
+        dos2unix_process = subprocess.run(dos2unix, cwd=f"{self.extract_location}", encoding='utf-8', universal_newlines='\n', capture_output=True)
+
+        print(dos2unix_process.stdout)"""
+
+        if build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        if install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        libpng_config_cmake = [
+            'cmake',
+            '-G',
+            'Unix Makefiles' if on_macos else 'Visual Studio 16 2019',
+            '-DPNG_TESTS=OFF',
+            '-DPNG_SHARED=OFF',
+            '-DAWK=/usr/local/bin/gawk',
+            f'-DCMAKE_SYSTEM_PREFIX={install_dir}',
+            f'-DCMAKE_INSTALL_PREFIX={install_dir}',
+            f'{self.extract_location}'
+        ]
+
+        libpng_config_process = subprocess.run(libpng_config_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if libpng_config_process.returncode!=0:
+            print("Configuring libPNG failed")
+            print(libpng_config_process.stdout)
+            print(libpng_config_process.stderr)
+            raise Exception("Configuring libPNG failed")
+        else:
+            print("libPNG configured")
+
+
+        make_process = subprocess.run(['cmake', '--build', '.', '--target', 'install'], cwd=build_dir, encoding='utf-8', universal_newlines='\n', capture_output=True)
+
+        if make_process.returncode!=0:
+            print("Building libPNG failed")
+            print(make_process.stdout)
+            print(make_process.stderr)
+            raise Exception("Building libPNG failed")
+
+        already_built.touch()
+```
+
+##### LibPNG Windows builder
+
+``` py : <<libpng windows builder>>=
+def libpng_windows_build(self) -> None:
+    already_built = build_folder / 'libpng.built'
+    print("="*20)
+    print(f"\nBuilding {self.name}")
+    print(f"For {self.name} extract location: {self.extract_location}")
+
+    sln = self.extract_location / 'projects' / 'vstudio' / 'vstudio.sln'
+
+    build_settings = [f"{msbuild}",
+                      f"{sln}",
+                      "/t:libpng",
+                      "/p:Configuration=Release Library",
+                      "/p:Platform=x64",
+                      "/m"
+    ]
+
+    if not already_built.exists():
+        completed_process = subprocess.run(build_settings, encoding='utf-8', universal_newlines='\n', capture_output=True)
+        print(completed_process.stdout)
+        already_built.touch()
+```
+
+#### The libPNG package
+
+``` py : <<libpng package>>=
+def libpng_include_dir(self) -> str:
+    return ""
+
+def libpng_library_dir(self) -> str:
+    return ""
+
+def libpng_package(self) -> None:
+    pass
+
+<<libpng patcher>>
+
+<<libpng macos builder>>
+
+<<libpng windows builder>>
+
+<<libpng builder>>
+
+@register_package
+def libpng():
+    <<libpng version>>
+    <<libpng download location>>
+    libpng_local = dl_folder / f'libpng_{libpng_version_n}.tar.gz'
+    libpng_dep = Package("libpng", libpng_version, libpng_url, libpng_local,
+                            download_and_extract_package,
+                            libpng_include_dir, libpng_library_dir, libpng_patch,
+                            libpng_build, libpng_package,
+                            ['zlib'], '')
+    return libpng_dep
+```
+
+### building embree
+
+embree is used for tracing in the bvh when it is set to use the embree library. this section handles building of the embree library.
+
+the version of the embree library used is
+
+``` py : <<embree version>>=
+embree_version = '3.13.2'
+```
+
+with this information we can generate the download location of the library from github
+
+``` py : <<embree download location>>=
+embree_url = f'https://github.com/embree/embree/archive/refs/tags/v{embree_version}.zip'
+```
+
+#### Embree builder
+
+building of embree is managed through cmake. currently building is done without the thread building blocks (tbb) library, but that may change in the future.
+
+``` py : <<embree builder>>=
+def embree_build(self) -> None:
+    print(self.extract_location)
+    already_built = build_folder / 'embree.built'
+    # we shouldn't build in the source directory (extract_location)
+    build_dir = (self.extract_location / '..' / 'embree_build').resolve()
+    install_dir = (self.extract_location / '..' / 'embree_install').resolve()
+    if not already_built.exists():
+        if build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        if install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        tasking_system = 'INTERNAL' if on_macos else 'PPL'
+
+        embree_config_cmake = [
+            'cmake',
+            '-G',
+            'Unix Makefiles' if on_macos else 'Visual Studio 16 2019',
+            f'-DCMAKE_SYSTEM_PREFIX={install_dir}',
+            f'-DCMAKE_INSTALL_PREFIX={install_dir}',
+            '-DEMBREE_LIBRARY_NAME=embree3_RH',
+            f'-DEMBREE_TASKING_SYSTEM={tasking_system}', # tbb (thread building blocks), ppl (parallel patterns library, windows only), internal
+            '-DEMBREE_ISPC_SUPPORT=OFF',
+            '-DEMBREE_TUTORIALS=OFF',
+            #'-dopenexr_lib_suffix=-rh-2_5',
+            #'-dilmbase_lib_suffix=-rh-2_5',
+            f"{self.extract_location}"
+        ]
+
+        embree_config_process = subprocess.run(embree_config_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if embree_config_process.returncode!=0:
+            print(embree_config_process.stdout)
+            print(embree_config_process.stderr)
+            raise Exception("embree configuration failed")
+
+        embree_build_cmake = [
+            'cmake',
+            '--build',
+            '.',
+            '--target',
+            'install',
+            '--config',
+            'release'
+        ]
+        embree_build_process = subprocess.run(embree_build_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if embree_build_process.returncode!=0:
+            print(embree_build_process.stdout)
+            raise Exception("embree build failed")
+
+        already_built.touch()
+    else:
+        print(f"embree already built")
+```
+
+
+
+``` py : <<embree package>>=
+def embree_include_dir(self) -> str:
+    return ""
+
+def embree_library_dir(self) -> str:
+    return ""
+
+def embree_package(self) -> None:
+    pass
+
+<<embree builder>>
+
+@register_package
+def embree():
+    <<embree version>>
+    <<embree download location>>
+    embree_local = dl_folder / f'embree_{embree_version}.zip'
+    embree_dep = Package("embree", embree_version, embree_url, embree_local,
+                            download_and_extract_package,
+                            embree_include_dir, embree_library_dir, no_patches,
+                            embree_build, embree_package,
+                            [], '')
+    return embree_dep
+```
+
+### Building libTIFF
+
+The library `libTIFF` is a required dependency for `OpenImageIO`.
+
+the version of the libTIFF library used is
+
+``` py : <<libtiff version>>=
+libtiff_version = '4.3.0'
+```
+
+with this information we can generate the download location of the library from
+GitLab
+
+``` py : <<libtiff download location>>=
+libtiff_url = f'https://gitlab.com/libtiff/libtiff/-/archive/v{libtiff_version}/libtiff-v{libtiff_version}.zip'
+```
+
+Building of libtiff is managed through cmake. There are not many settings to
+handle, but we do ensure we have control over where the building happens and
+where the resulting files get copied to.
+
+#### Patching libTIFF
+
+To be able to configure the library properly we are going to apply a patch that
+will disable many parts of the CMake configuration process. This is done primarily for the benefit of MacOS, but it doesn't hurt to do on Windows, either.
+
+``` py : <<libtiff patcher>>=
+def libtiff_patch(self):
+    patch_file = current_path / 'patches' / 'libtiff_build_system.patch'
+    patch_file_applied = build_folder / 'libtiff_build_system.patch.applied'
+
+    if not patch_file_applied.exists():
+        patch_command = [
+            'git',
+            'apply',
+            '--ignore-space-change',
+            '--ignore-whitespace',
+            '--whitespace=nowarn',
+            '-p1',
+            f"{patch_file}"
+        ]
+        patch_process = subprocess.run(patch_command, cwd=self.extract_location, encoding='utf-8', universal_newlines='\n', capture_output=True)
+        if patch_process.returncode!=0:
+            print(patch_process.stderr)
+            print(patch_process.stdout)
+            raise Exception("libtiff patching failed.")
+        patch_file_applied.touch()
+        print("libtiff patch successfully applied.")
+    else:
+        print("libtiff patch already applied.")
+```
+
+#### Configuring and buildng libTIFF
+
+``` py : <<libtiff builder>>=
+def libtiff_build(self) -> None:
+    print(self.extract_location)
+    already_built = build_folder / 'libtiff.built'
+    # we shouldn't build in the source directory (extract_location)
+    build_dir = Path(self.extract_location) / '..' / 'libtiff_build'
+    install_dir = Path(self.extract_location) / '..' / 'libtiff_install'
+
+    if not already_built.exists():
+        if build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        if install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        for p in packages:
+            if p.name.lower() == 'zlib':
+                zlib_library = p.get_library_dir(p)
+                zlib_include_dir = p.get_include_dir(p)
+            if p.name.lower() == 'libjpeg':
+                jpeg_library = p.get_library_dir(p)
+                jpeg_include_dir = p.get_include_dir(p)
+
+        libtiff_config_cmake = [
+            'cmake',
+            '-G',
+            'Unix Makefiles' if on_macos else 'Visual Studio 16 2019',
+            f'-DCMAKE_SYSTEM_PREFIX={install_dir}',
+            f'-DCMAKE_INSTALL_PREFIX={install_dir}',
+            '-DBUILD_SHARED_LIBS=OFF',
+            f'-DZLIB_LIBRARY={zlib_library}',
+            f'-DZLIB_INCLUDE_DIR={zlib_include_dir}',
+            f'-DJPEG_LIBRARY={jpeg_library}',
+            f'-DJPEG_INCLUDE_DIR={jpeg_include_dir}',
+            '-Dlerc=OFF',
+            '-Dlibdeflate=OFF',
+            '-Djbig=OFF',
+            '-Djpeg12=OFF',
+            '-Dwebp=OFF',
+            '-Dzstd=OFF',
+            '-DENABLE_WebP=OFF',
+            '-DENABLE_WEBP=OFF',
+            '-DENABLE_ZSTD=OFF',
+            '-DENABLE_JPEG12=OFF',
+            '-DENABLE_JBIG=OFF',
+            f"{self.extract_location}"
+        ]
+
+        libtiff_config_process = subprocess.run(libtiff_config_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if libtiff_config_process.returncode!=0:
+            print(libtiff_config_process.stdout)
+            print(libtiff_config_process.stderr)
+            raise Exception("libtiff configuration failed")
+
+        libtiff_build_cmake = [
+            'cmake',
+            '--build',
+            '.',
+            '--target',
+            'install',
+            '--config',
+            'release'
+        ]
+        libtiff_build_process = subprocess.run(libtiff_build_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if libtiff_build_process.returncode!=0:
+            print(libtiff_build_process.stdout)
+            raise Exception("libtiff build failed")
+
+        already_built.touch()
+    else:
+        print(f"libtiff already built")
+```
+
+
+
+``` py : <<libtiff package>>=
+def libtiff_include_dir(self) -> str:
+    install_dir = (Path(self.extract_location) / '..' / 'libtiff_install' / 'include').resolve()
+    return f"{install_dir}"
+
+def libtiff_library_dir(self) -> str:
+    if on_macos:
+        lib = Path(self.extract_location) / '..' / 'libtiff_install' / 'lib' / 'libtiff.a'
+    else:
+        lib = Path(self.extract_location) / '..' / 'libtiff_install' / 'lib' / 'tiff.lib'
+    lib = lib.resolve()
+    return f"{lib}"
+
+def libtiff_package(self) -> None:
+    pass
+
+<<libtiff patcher>>
+<<libtiff builder>>
+
+@register_package
+def libtiff():
+    <<libtiff version>>
+    <<libtiff download location>>
+    libtiff_local = dl_folder / f'libtiff_{libtiff_version}.zip'
+    libtiff_dep = Package("libtiff", libtiff_version, libtiff_url, libtiff_local,
+                            download_and_extract_package,
+                            libtiff_include_dir, libtiff_library_dir, libtiff_patch,
+                            libtiff_build, libtiff_package,
+                            ['libjpeg'], '')
+    return libtiff_dep
+```
+
+### Building libJPEG
+
+The library `libJPEG` is a required dependency for `OpenImageIO`.
+
+the version of the libJPEG library used is
+
+``` py : <<libjpeg version>>=
+libjpeg_version = '2.1.1'
+```
+
+with this information we can generate the download location of the library from
+GitLab
+
+``` py : <<libjpeg download location>>=
+libjpeg_url = f'https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/{libjpeg_version}.zip'
+```
+
+building of libjpeg is managed through cmake. There are not many settings to
+handle, but we do ensure we have control over where the building happens and
+where the resulting files get copied to.
+
+``` py : <<libjpeg builder>>=
+def libjpeg_build(self) -> None:
+    print(self.extract_location)
+    already_built = build_folder / 'libjpeg.built'
+    # we shouldn't build in the source directory (extract_location)
+    build_dir = Path(self.extract_location) / '..' / 'libjpeg_build'
+    install_dir = Path(self.extract_location) / '..' / 'libjpeg_install'
+
+    if not already_built.exists():
+        if build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        if install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        libjpeg_config_cmake = [
+            'cmake',
+            '-G',
+            'Unix Makefiles' if on_macos else 'Visual Studio 16 2019',
+            f'-DCMAKE_SYSTEM_PREFIX={install_dir}',
+            f'-DCMAKE_INSTALL_PREFIX={install_dir}',
+            f"{self.extract_location}"
+        ]
+
+        libjpeg_config_process = subprocess.run(libjpeg_config_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if libjpeg_config_process.returncode!=0:
+            print(libjpeg_config_process.stdout)
+            print(libjpeg_config_process.stderr)
+            raise Exception("libjpeg configuration failed")
+
+        libjpeg_build_cmake = [
+            'cmake',
+            '--build',
+            '.',
+            '--target',
+            'install',
+            '--config',
+            'release'
+        ]
+        libjpeg_build_process = subprocess.run(libjpeg_build_cmake, cwd=build_dir, encoding='utf-8', capture_output=True)
+        if libjpeg_build_process.returncode!=0:
+            print(libjpeg_build_process.stdout)
+            raise Exception("libjpeg build failed")
+
+        already_built.touch()
+    else:
+        print(f"libjpeg already built")
+```
+
+
+
+``` py : <<libjpeg package>>=
+def libjpeg_include_dir(self) -> str:
+    install_dir = (Path(self.extract_location) / '..' / 'libjpeg_install' / 'include').resolve()
+    return f"{install_dir}"
+
+def libjpeg_library_dir(self) -> str:
+    if on_macos:
+        lib = Path(self.extract_location) / '..' / 'libjpeg_install' / 'lib' / 'libjpeg.a'
+    else:
+        lib = Path(self.extract_location) / '..' / 'libjpeg_install' / 'lib' / 'jpeg.lib'
+    lib = lib.resolve()
+    return f"{lib}"
+
+def libjpeg_package(self) -> None:
+    pass
+
+<<libjpeg builder>>
+
+@register_package
+def libjpeg():
+    <<libjpeg version>>
+    <<libjpeg download location>>
+    libjpeg_local = dl_folder / f'libjpeg_{libjpeg_version}.zip'
+    libjpeg_dep = Package("libjpeg", libjpeg_version, libjpeg_url, libjpeg_local,
+                            download_and_extract_package,
+                            libjpeg_include_dir, libjpeg_library_dir, no_patches,
+                            libjpeg_build, libjpeg_package,
+                            [], '')
+    return libjpeg_dep
+```

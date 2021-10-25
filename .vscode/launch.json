@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Build Dependencies",
+            "type": "python",
+            "request": "launch",
+            "preLaunchTask": "Process Literate Program",
+            "program": "${workspaceFolder}/build_cycles_packages.py",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Dependencies RETAIN EVERYTHING",
+            "type": "python",
+            "request": "launch",
+            "preLaunchTask": "Process Literate Program",
+            "program": "${workspaceFolder}/build_cycles_packages.py",
+            "args": ["--no-clean-dl", "--no-clean-build"],
+            "console": "integratedTerminal"
+        }
+    ]
+}

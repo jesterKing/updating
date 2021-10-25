@@ -1,0 +1,1628 @@
+<html>
+	<head>
+		<link rel="stylesheet" type="text/css" href="./style.css">
+	</head>
+	<body>
+	<h1>RhinoCycles, The Book</h1>
+<p>There are several parts to integrating Cycles: syncing the source code with
+upstream Cycles code base, applying RhinoCycles patches, updating bindings and
+adapt client code using Cycles and the integration.</p>
+<p>The goal of this book is to address each of this areas whilst simultanously
+creating all the code needed to create a workable Cycles integration into
+Rhinoceros 3D.</p>
+<h2>Part I: codebase syncing</h2>
+<p>We are maintaining a repository similar to the main Cycles repository
+git@git.blender.org:/cycles.git. Since the main repository is updated with the
+Blender Cycles code base in git@git.blender.org:/blender.git rather infrequently
+we do similar updating ourselves on a much more regular basis. There are still
+manual steps to the process used by the Cycles developers, and as such we are
+trying to automate this as much as possible.</p>
+<p>We will handle the syncing in the branch  <code>rhinomaster</code> in the repository
+https://github.com/mcneel/cycles, which is a fork of the original standalone
+repository.</p>
+<p>To determine commits to transfer we create a map from logs using as the key the
+subject decorated with the timestamp from the author. The log is created with as
+format <code>%H %at %s</code>, which gives the commit hash, the author timestamp and the
+subject. The hash will be used as value to its key.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;git log for repository&gt;&gt;=</div><div class="code"><pre><code>    command = (c <span class="hljs-keyword">for</span> c <span class="hljs-keyword">in</span> (<span class="hljs-string">b&quot;git&quot;</span>,
+               <span class="hljs-string">b&quot;--git-dir=&quot;</span> + os.path.join(repository, <span class="hljs-string">b&#x27;.git&#x27;</span>),
+               <span class="hljs-string">b&quot;--work-tree=&quot;</span> + repository,
+               <span class="hljs-string">b&quot;log&quot;</span>, <span class="hljs-string">b&quot;--format=%H %at %s&quot;</span>, <span class="hljs-string">b&quot;--reverse&quot;</span>,
+               start_commit + <span class="hljs-string">b&#x27;..HEAD&#x27;</span> <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(start_commit)&gt;<span class="hljs-number">0</span> <span class="hljs-keyword">else</span> <span class="hljs-string">&#x27;&#x27;</span>,
+               os.path.join(repository, path))
+               <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(c)&gt;<span class="hljs-number">0</span>
+    )
+</code></pre>
+</div></div><p>The goal is to have matching subjects and author times between the repositories.
+Although it is highly unlikely that two commits in seperate repositories are
+created at the exact very time the subject of the commit is taken along. That
+said, it is a good idea to first check on the timestamp and take the subject
+into account only when the timestamps exactly match. Once this is the case we
+can compare the subjects of the commits. Calculating an edit distance could be
+useful to determine commits that are the same, even though the subjects differ
+slightly.</p>
+<p>If a commit hash is matched to one of the IGNORE_HASHES it is not added to the
+commit map.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;get commit map&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">commit_map_get</span>(<span class="hljs-params">repository, path, start_commit</span>):
+    &lt;&lt;git log <span class="hljs-keyword">for</span> repository&gt;&gt;
+    lines = subprocess.check_output(command).split(<span class="hljs-string">b&quot;\n&quot;</span>)
+    commit_map = collections.OrderedDict()
+    <span class="hljs-keyword">for</span> line <span class="hljs-keyword">in</span> lines:
+        <span class="hljs-keyword">if</span> line:
+            commit_sha, stamped_subject = line.split(<span class="hljs-string">b&#x27; &#x27;</span>, <span class="hljs-number">1</span>)
+            stamp, subject = stamped_subject.split(<span class="hljs-string">b&#x27; &#x27;</span>, <span class="hljs-number">1</span>)
+            subject = subject_strip(<span class="hljs-string">b&quot;&quot;</span>, subject).rstrip(<span class="hljs-string">b&quot;.&quot;</span>)
+            stamped_subject = stamp + <span class="hljs-string">b&quot; &quot;</span> + subject
+
+            <span class="hljs-keyword">if</span> commit_sha <span class="hljs-keyword">in</span> IGNORE_HASHES:
+                <span class="hljs-keyword">continue</span>
+            commit_map[stamped_subject] = commit_sha
+    <span class="hljs-keyword">return</span> commit_map
+</code></pre>
+</div></div><p>TBD: INCOMPLETE. Current Cycles standalone repository and missing commits don't
+agree much between each other. Especially the patch for the big Cycles X merge
+is causing trouble for git am and git apply.</p>
+<h2>Part II : generating .NET bindings</h2>
+<p>To integrate the Cycles rendering engine into Rhinoceros 3D we need .NET
+bindings. These are created using the tool <code>ClangSharpPInvokeGenerator</code>.</p>
+<p>The tool can be used in combination with a response file to ensure command-line
+invocation doesn't go past the command-line length limit.</p>
+<p>Each element of the command-line invocation goes on a separate line. Options and
+paramaters, values to these are all separated by newline.</p>
+<p>With the response file the generator will be configured for code generation, how
+to parse the input. There will be also all the necessary defines that will be
+used to analyze the code. Finally the output will be configured. Here we can
+specify a text file whose content will be prepended to each file. This ensures
+all automatically generated files will have the necessary content.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;rsp file.*&gt;&gt;=</div><div class="code"><pre title=": <<rsp file.*>>= ./configuration.rsp">&lt;&lt;rsp generator configuration&gt;&gt;
+&lt;&lt;rsp cycles defines&gt;&gt;
+&lt;&lt;rsp cycles input files&gt;&gt;
+&lt;&lt;rsp output configuration&gt;&gt;
+</pre>
+</div></div><p>We will be generating bindings for all necessary parts. These are defined over
+many header files, and we want the generated bindings to reflect this. This is
+done with the <code>multi-file</code>.</p>
+<p>For code generation the target is the latest stable .NET version and C# version,
+which at the time of writing are .NET 5 and C# 9.0. To ensure that the argument
+<code>latest-codegen</code> is used.</p>
+<p>At the moment it is not clear what types should be generated. But since most of
+the work takes currently place on the Windows platform we specify
+<code>windows-types</code>.</p>
+<p>To understand where enums come from require that they are fully qualified, use
+<code>exclude-using-statics-for-enums</code>.</p>
+<p>All the generator configuration settings are given as arguments to the
+<code>--config</code> option.</p>
+<p>To help with identifying potential problems specify the logging
+settings <code>log-exclusions</code>, <code>log-potential-typedef-remappings</code> and
+<code>log-visited-files</code>.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;rsp generator configuration&gt;&gt;=</div><div class="code"><pre title=": <<rsp generator configuration>>=">--config
+latest-codegen
+windows-types
+exclude-using-statics-for-enums
+exclude-default-remappings
+exclude-anonymous-field-helpers
+exclude-fnptr-codegen
+exclude-enum-operators
+multi-file
+generate-tests-nunit
+generate-cpp-attributes
+log-exclusions
+log-potential-typedef-remappings
+log-visited-files
+--additional
+-ferror-limit=1000
+-Wc++17-extensions
+-std
+c++17
+--exclude
+ccl::TextureMapping::Mapping
+ccl::TextureMapping::Projection
+ccl::NodeMappingType
+ccl::DEVICE_MASK_ALL
+ccl::float4
+ccl::float3
+ccl::Transform
+Namespace
+LongDouble
+ClassTemplatePartialSpecialization
+error_code
+hash
+system_error
+__non_rtti_object
+std::__non_rtti_object
+string
+std::string
+default_error_condition
+--remap
+char*=string
+ccl::TextureMapping::Mapping=int
+ccl::TextureMapping::Projection=int
+ccl::NodeMappingType=int
+ccl::DEVICE_MASK_ALL=0
+ccl::float4=float*
+ccl::float3=float*
+ccl::Transform=float*
+</pre>
+</div></div><p>To parse Cycles headers correctly a set of defines has to be passed to the
+generator. These include the namespace defines <code>CCL_NAMESPACE_BEGIN</code> and
+<code>CCL_NAMESPACE_END</code>. For the API no other defines are needed.</p>
+<p>A few defines are given to suppress</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;rsp cycles defines&gt;&gt;=</div><div class="code"><pre title=": <<rsp cycles defines>>=">--define-macro
+CCL_NAMESPACE_BEGIN=namespace ccl {
+CCL_NAMESPACE_END=}
+LOG(x)=
+_CRT_SECURE_NO_WARNINGS
+_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS
+_MT
+</pre>
+</div></div><p>There are two pieces to be specified. Firstly the input files. We'll start with
+the files <code>session.h</code> and <code>device.h</code>. Secondly the include directories need to
+be specified so the generator can properly parse the input files.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;rsp cycles input files&gt;&gt;=</div><div class="code"><pre title=": <<rsp cycles input files>>=">--file
+D:/Dev/Rhino/rhino7/src4/rhino4/Plug-ins/RDK/cycles/ccycles/ccycles.h
+--include-directory
+D:/Dev/Rhino/rhino7/src4/rhino4/Plug-ins/RDK/cycles/ccycles/ccycles.h
+</pre>
+</div></div><p>In the generated files we want to use <code>ccl</code> as the namespace. Furthermore the
+files should be realized in the folder <code>Interop</code>. The generated tests go to
+<code>InteropTests</code>.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;rsp output configuration&gt;&gt;=</div><div class="code"><pre title=": <<rsp output configuration>>=">--libraryPath
+ccycles.dll
+--namespace
+ccl
+--output
+./Interop
+--test-output
+./InteropTests
+</pre>
+</div></div><p>To run the <code>ClangSharpPInvokeGenerator</code> tool in PowerShell run as follows:</p>
+<pre><code><span class="hljs-built_in">PS</span>&gt; ClangSharpPInvokeGenerator.exe <span class="hljs-string">&quot;@configuration.rsp&quot;</span>
+</code></pre>
+<h3>Installing and updating ClangSharpPInvokeGenerator</h3>
+<p>The tool is installed as a dotnet tool. This can be done as follows:</p>
+<pre><code><span class="hljs-built_in">PS</span>&gt; dotnet tool install -<span class="hljs-literal">-global</span> ClangSharpPInvokeGenerator -<span class="hljs-literal">-version</span> <span class="hljs-number">12.0</span>.<span class="hljs-number">0</span><span class="hljs-literal">-beta1</span>
+</code></pre>
+<p>To find out if a newer version is available use:</p>
+<pre><code><span class="hljs-built_in">PS</span>&gt; dotnet tool search -<span class="hljs-literal">-prerelease</span> ClangSharpPInvokeGenerator
+</code></pre>
+<p>When a newer version is available use something like:</p>
+<pre><code><span class="hljs-built_in">PS</span>&gt; dotnet tool update -<span class="hljs-literal">-global</span> ClangSharpPInvokeGenerator -<span class="hljs-literal">-version</span> <span class="hljs-number">12.0</span>.<span class="hljs-number">0</span><span class="hljs-literal">-beta2</span>
+</code></pre>
+<p>but with the version number adapted to what the latest is at the time of
+checking.</p>
+<h1>Building Cycles</h1>
+<p>There are several parts to getting Cycles built: dependencies and Cycles itself.</p>
+<p>A script for keeping the project files with which the Cycles source code is
+built has been created: <code>update_projectfiles.py</code>. This script lives under
+<code>$(RHINOROOT)/src4/tools/CyclesProjectUpdater</code>. This is expected to be run in
+that directory with a Python 3 interpreter:</p>
+<pre><code><span class="hljs-built_in">PS</span>&gt; <span class="hljs-built_in">cd</span> <span class="hljs-variable">$</span>(RHINOROOT)/src4/tools/CyclesProjectUpdater
+<span class="hljs-built_in">PS</span>&gt; python update_projectfiles.py
+</code></pre>
+<h2>Building dependencies for Cycles</h2>
+<p>Building of the dependencies for Cycles is automated through a Python script
+<code>build_cycles_packages.py</code>. Since we will be using this tool on multiple
+platforms we need to be able to determine which platform it is running on.
+Dependencies may need different settings and building procedures based on the
+platform. To that end we import the <code>platform</code> module.</p>
+<p>As a convenience variable lets here initializze <code>on_macos</code> since we are
+currently buildin on two platforms</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;imports&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">import</span> platform
+on_macos = platform.system()==<span class="hljs-string">&#x27;Darwin&#x27;</span>
+</code></pre>
+</div></div><h2>TODO with Cycles dependencies building</h2>
+<ul>
+<li>Double-check and fixup RPATH issues. See <a href="https://gitlab.kitware.com/cmake/community/-/wikis/doc/cmake/RPATH-handling">the cmake page on RPATH</a> as part of the investigation.
+<ul>
+<li>OpenImageIO
+<ul>
+<li>Ensure building and linking against correct libraries - not the ones already installed, but the ones created by this tool</li>
+</ul>
+</li>
+</ul>
+</li>
+<li>Investigate building for Apple Silicon</li>
+</ul>
+<h3>The Package class</h3>
+<p>Packages are expressed through instances of the <code>Package</code> class. For this script
+instances of the class shall be created through creator functions that are
+decorated with <code>@register_package</code>, which then will be added to the <code>packages</code>
+list.</p>
+<h4>Registering packages</h4>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;register package decorator&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">register_package</span>(<span class="hljs-params">func : <span class="hljs-type">Callable</span>[[<span class="hljs-literal">None</span>], Package]</span>):
+    <span class="hljs-string">&quot;&quot;&quot;Register package function&quot;&quot;&quot;</span>
+    package = func()
+    packages.append(package)
+
+    <span class="hljs-keyword">return</span> func
+</code></pre>
+</div></div><p>In the <code>register_package</code> signature the parameter is annotated with <code>Callable</code>, which comes from the <code>typing</code> module. Ensure it is imported</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;imports&gt;&gt;=+</div><div class="code"><pre><code><span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">Callable</span>
+</code></pre>
+</div></div><p>Note that these imports all will be added to the <code>&lt;&lt;imports&gt;&gt;</code> fragment.</p>
+<h4>Sorting packages</h4>
+<p>To sort the package list a topological sort using <a href="https://en.wikipedia.org/wiki/Topological_sorting#Kahn's_algorithm">Kahn's
+algorithm</a>
+is applied.</p>
+<p>First a deep copy of each package instance in <code>packages</code>is created to ensure we
+don't mess up the <code>dependencies</code> list of each package while going through the
+algorithm. This copied list is available as <code>G</code>, which represents the graph in
+the algorithm explanation in the linked Wikipedia above. Since this will contain
+packages from which the dependencies are removed as they are identified and
+handled we will have the situation where at the end of the sorting any missing
+dependencies are still left in packages of that list <code>G</code>. This list will be
+checked in <code>&lt;&lt;check registration consistency&gt;&gt;</code>.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;sort packages&gt;&gt;=</div><div class="code"><pre><code>G = [copy.deepcopy(p) <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> packages]
+S = [copy.deepcopy(p) <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> G <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(p.dependencies)==<span class="hljs-number">0</span>]
+<span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> S:
+    p.dependencies = [d.lower() <span class="hljs-keyword">for</span> d <span class="hljs-keyword">in</span> p.dependencies]
+L : <span class="hljs-type">List</span>[Package] = <span class="hljs-built_in">list</span>()
+<span class="hljs-keyword">while</span> <span class="hljs-built_in">len</span>(S)&gt;<span class="hljs-number">0</span>:
+    n = S.pop(<span class="hljs-number">0</span>)
+    L.append(n)
+    <span class="hljs-keyword">for</span> m <span class="hljs-keyword">in</span> G:
+        <span class="hljs-keyword">if</span> n.name.lower() <span class="hljs-keyword">in</span> m.dependencies:
+            m.dependencies.remove(n.name.lower())
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(m.dependencies)==<span class="hljs-number">0</span>:
+                S.append(m)
+
+_packages = {p.name: p <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> packages}
+packages = [_packages[p.name] <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> L]
+</code></pre>
+</div></div><p>The <code>deepcopy</code> method comes from the <code>copy</code> module. That we need to import</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;imports&gt;&gt;=+</div><div class="code"><pre><code><span class="hljs-keyword">import</span> copy
+</code></pre>
+</div></div><h4>Package declaration</h4>
+<p>The <code>Package</code> class gives information on download URL, local download location,
+extract location, include directories and library directories provided by this
+package. Additionally packages that instantiate this class should pass in
+functions for patching, building and preparing final package. Packages should
+also provide a list the names of packages they depend on. The casing of the name
+does not matter, as long as the lower-cased version of it matches the
+lower-cased name of a package.</p>
+<p><code>Package</code> is implemented as a <code>@dataclass</code>, along with slots.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;Package class&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-meta">@dataclass</span>
+<span class="hljs-keyword">class</span> <span class="hljs-title class_">Package</span>:
+    __slots__ = [<span class="hljs-string">&quot;name&quot;</span>, <span class="hljs-string">&quot;version&quot;</span>, <span class="hljs-string">&quot;url&quot;</span>, <span class="hljs-string">&quot;local&quot;</span>, <span class="hljs-string">&quot;acquire&quot;</span>, <span class="hljs-string">&quot;get_include_dir&quot;</span>,
+                 <span class="hljs-string">&quot;get_library_dir&quot;</span>, <span class="hljs-string">&quot;patcher&quot;</span>, <span class="hljs-string">&quot;builder&quot;</span>, <span class="hljs-string">&quot;prepare_package&quot;</span>,
+                 <span class="hljs-string">&quot;dependencies&quot;</span>, <span class="hljs-string">&quot;extract_location&quot;</span>]
+    name : <span class="hljs-built_in">str</span>
+    version : <span class="hljs-built_in">str</span>
+    url : <span class="hljs-built_in">str</span>
+    local : Path
+    acquire : <span class="hljs-type">Callable</span>[..., <span class="hljs-literal">None</span>]
+    get_include_dir : <span class="hljs-type">Callable</span>[..., <span class="hljs-built_in">str</span>]
+    get_library_dir : <span class="hljs-type">Callable</span>[..., <span class="hljs-built_in">str</span>]
+    patcher : <span class="hljs-type">Callable</span>[..., <span class="hljs-literal">None</span>]
+    builder : <span class="hljs-type">Callable</span>[..., <span class="hljs-literal">None</span>]
+    prepare_package: <span class="hljs-type">Callable</span>[..., <span class="hljs-literal">None</span>]
+    dependencies : <span class="hljs-type">List</span>[<span class="hljs-built_in">str</span>]
+    extract_location : <span class="hljs-built_in">str</span>
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">acquire_it</span>(<span class="hljs-params">self</span>):
+        <span class="hljs-keyword">if</span> self.acquire:
+            <span class="hljs-keyword">return</span> self.acquire(self)
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">build_it</span>(<span class="hljs-params">self</span>):
+        <span class="hljs-keyword">if</span> self.builder:
+            <span class="hljs-keyword">return</span> self.builder(self)
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">patch_it</span>(<span class="hljs-params">self</span>):
+        <span class="hljs-keyword">if</span> self.patcher:
+            <span class="hljs-keyword">return</span> self.patcher(self)
+</code></pre>
+</div></div><p>The <code>@dataclass</code> decorator is provided by the <code>dataclasses</code> module. The <code>List</code> annotation type is also needed, which is provided by the <code>typing</code> module. The module <code>pathlib</code> provides the <code>Path</code> type.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;imports&gt;&gt;=+</div><div class="code"><pre><code><span class="hljs-keyword">from</span> dataclasses <span class="hljs-keyword">import</span> data<span class="hljs-keyword">class</span>
+<span class="hljs-title class_">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">List</span>
+<span class="hljs-keyword">from</span> pathlib <span class="hljs-keyword">import</span> Path
+</code></pre>
+</div></div><p>The script sets up a couple of variables like the download and build folders and
+handles parsing of the arguments. It provides the main structure for building.</p>
+<p>In <code>&lt;&lt;all packages&gt;&gt;</code> each package is defined and registered. As mentioned
+earlier, the <code>register_package</code> decorator will take care of sorting the package
+in the proper order for building, thus ensuring all dependencies are acquired
+and realized at the correct time.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;build cycles packages.*&gt;&gt;=</div><div class="code"><pre><code>&lt;&lt;imports&gt;&gt;
+<span class="hljs-keyword">import</span> subprocess
+
+&lt;&lt;Package <span class="hljs-keyword">class</span>&gt;&gt;
+
+<span class="hljs-comment"># will gather all the different packages that exist.</span>
+packages : <span class="hljs-type">List</span>[Package] = <span class="hljs-built_in">list</span>()
+
+&lt;&lt;register package decorator&gt;&gt;
+
+&lt;&lt;no patches&gt;&gt;
+
+msbuild = Path(<span class="hljs-string">r&#x27;C:\Program Files (x86)\Microsoft Visual Studio\2019\Professional\MSBuild\Current\Bin\MSBuild.exe&#x27;</span>)
+
+current_path = Path(<span class="hljs-string">&#x27;.&#x27;</span>).resolve()
+dl_folder = current_path / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;cycles_dependencies_dl&#x27;</span>
+dl_folder = dl_folder.resolve()
+build_folder = current_path / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;cycles_dependencies_build&#x27;</span>
+build_folder = build_folder.resolve()
+
+&lt;&lt;parse command-line arguments&gt;&gt;
+
+&lt;&lt;url download progress&gt;&gt;
+
+&lt;&lt;recursive folder content delete&gt;&gt;
+
+&lt;&lt;download <span class="hljs-keyword">and</span> extract package&gt;&gt;
+
+<span class="hljs-keyword">if</span> args.clean_dl:
+    <span class="hljs-keyword">if</span> dl_folder.exists():
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Cleaning out <span class="hljs-subst">{dl_folder}</span>...&quot;</span>)
+        folder_recursive_delete(dl_folder)
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;... clean complete.&quot;</span>)
+    dl_folder.mkdir()
+<span class="hljs-keyword">else</span>:
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> dl_folder.exists():
+        dl_folder.mkdir()
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Not cleaning out old download results&quot;</span>)
+
+<span class="hljs-keyword">if</span> args.clean_build:
+    <span class="hljs-keyword">if</span> build_folder.exists():
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Cleaning out <span class="hljs-subst">{build_folder}</span>...&quot;</span>)
+        folder_recursive_delete(build_folder)
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;... clean complete.&quot;</span>)
+    build_folder.mkdir()
+<span class="hljs-keyword">else</span>:
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> build_folder.exists():
+        build_folder.mkdir()
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Not cleaning out build results&quot;</span>)
+
+&lt;&lt;<span class="hljs-built_in">all</span> packages&gt;&gt;
+
+&lt;&lt;sort packages&gt;&gt;
+
+&lt;&lt;check registration consistency&gt;&gt;
+
+<span class="hljs-keyword">for</span> package <span class="hljs-keyword">in</span> packages:
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Fetching <span class="hljs-subst">{package.name}</span>...&quot;</span>)
+    package.acquire_it()
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Patching <span class="hljs-subst">{package.name}</span>...&quot;</span>)
+    package.patch_it()
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Building <span class="hljs-subst">{package.name}</span>...&quot;</span>)
+    package.build_it()
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{package.name}</span> ready&quot;</span>)
+
+</code></pre>
+</div></div><p>The script understands command-line arguments for control of the flow. For argument parsing bring in the correct module</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;imports&gt;&gt;=+</div><div class="code"><pre><code><span class="hljs-keyword">import</span> argparse
+</code></pre>
+</div></div><p>Then set up the argument parsing and add all the arguments we want. The cleaning out of downloads is handled with <code>--clean_dl</code>. It is defined with action <code>BooleanOptionalAction</code>, which allows the user to specify on the command-line <code>--no-clean_dl</code> to prevent the download folder from being cleaned out.</p>
+<p>Cleaning of the <code>build_folder</code> is controlled with <code>--clean_build</code>.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;parse command-line arguments&gt;&gt;=</div><div class="code"><pre><code>parser = argparse.ArgumentParser()
+parser.add_argument(<span class="hljs-string">&#x27;--clean-dl&#x27;</span>, action=argparse.BooleanOptionalAction, default=<span class="hljs-literal">True</span>)
+parser.add_argument(<span class="hljs-string">&#x27;--clean-build&#x27;</span>, action=argparse.BooleanOptionalAction, default=<span class="hljs-literal">True</span>)
+
+args = parser.parse_args()
+</code></pre>
+</div></div><h4>Ensuring package registry consistency</h4>
+<p>Before the register packages can be handled the script must check whether all
+depencies have been met. Since we have just sorted the package list in such a
+way that the validity of the sort wasn't checked we can do that now. In the <code>G</code>
+list we have all the packages that were visited during the sort. If there are
+any packages left that have still dependencies in their list we know those
+dependencies are the ones missing. We can thus print out the name of any
+offending package and the missing dependencies it declared.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;check registration consistency&gt;&gt;=</div><div class="code"><pre><code>incomplete_packages = [p <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> G <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(p.dependencies)&gt;<span class="hljs-number">0</span>]
+<span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(incomplete_packages)&gt;<span class="hljs-number">0</span>:
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;The following packages have missing dependencies:&quot;</span>)
+    <span class="hljs-keyword">for</span> ip <span class="hljs-keyword">in</span> incomplete_packages:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{ip.name}</span> - <span class="hljs-subst">{ip.dependencies!r}</span>&quot;</span>)
+    sys.exit(<span class="hljs-number">13</span>)
+</code></pre>
+</div></div><p>For early exiting the script with an error code (13) we use <code>sys.exit</code>. To that end
+the <code>sys</code> module needs to be imported.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;imports&gt;&gt;=+</div><div class="code"><pre><code><span class="hljs-keyword">import</span> sys
+</code></pre>
+</div></div><p>The downloads are placed in a temporary subfolder <code>dl</code> in the containing folder
+of the packages script. The folder is created if it does not exist yet. If
+it does exist already its contents are deleted to ensure no old downloads or
+builds interfere with the process.</p>
+<p>Extracting and building is done to a temporary subfolder <code>build</code> next to <code>dl</code>.
+The folder is also created if it does not exist yet. As with the download folder
+contents are deleted if the build folder already exists.</p>
+<p>To clean out a location the <code>folder_recursive_delete</code> from <code>&lt;&lt;recursive folder content delete&gt;&gt;</code> is used.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;recursive folder content delete&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">folder_recursive_delete</span>(<span class="hljs-params">folder : Path</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> folder.exists() <span class="hljs-keyword">or</span> <span class="hljs-keyword">not</span> folder.is_dir():
+        <span class="hljs-keyword">return</span>
+    <span class="hljs-keyword">for</span> child <span class="hljs-keyword">in</span> folder.iterdir():
+        <span class="hljs-keyword">if</span> child.is_dir():
+            folder_recursive_delete(child)
+        <span class="hljs-keyword">else</span>:
+            child.unlink()
+    folder.rmdir()
+</code></pre>
+</div></div><h4>Downloading packages</h4>
+<p>A download progress reporter function is defined to allow us to show progress
+during a download. This is important since a download may take a long while, and
+without any notification it can be hard to determine if the script should maybe
+restarted.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;url download progress&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">download_progress_reporter</span>(<span class="hljs-params">block_count : <span class="hljs-built_in">int</span>, block_size_in_bytes : <span class="hljs-built_in">int</span>, total_size : <span class="hljs-built_in">int</span></span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">if</span> total_size &gt; -<span class="hljs-number">1</span>:
+        perc = block_count * block_size_in_bytes / total_size * <span class="hljs-number">100</span>
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{block_count * block_size_in_bytes}</span> bytes (<span class="hljs-subst">{perc:<span class="hljs-number">.1</span>f}</span>%) downloaded of <span class="hljs-subst">{total_size}</span>\r&quot;</span>, end=<span class="hljs-string">&quot;&quot;</span>)
+    <span class="hljs-keyword">else</span>:
+        perc = <span class="hljs-string">&quot;~&quot;</span>
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{block_count * block_size_in_bytes}</span> bytes downloaded (total size unknown)\r&quot;</span>, end=<span class="hljs-string">&quot;&quot;</span>)
+</code></pre>
+</div></div><p>Downloading and extracting of a package is handled with <code>&lt;&lt;download and extract package&gt;&gt;</code>. Source archives are downloaded to the <code>dl_folder</code> and
+subsequently extracted to <code>build_folder</code>. If the archive already exists assume
+no downloading needed.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;download and extract package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">download_and_extract_package</span>(<span class="hljs-params">package : Package</span>) -&gt; <span class="hljs-literal">None</span>:
+    dep_local = package.local
+    dep_url = package.url
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> dep_local.exists():
+        <span class="hljs-comment">#print(f&quot;Start downloading {package.name} {package.version}...&quot;)</span>
+        dep_local_zip, httpmessage = urllib.request.urlretrieve(dep_url, <span class="hljs-built_in">str</span>(dep_local), download_progress_reporter)
+        <span class="hljs-comment">#print(f&quot;...download to {dep_local} complete.&quot;)</span>
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Extracting <span class="hljs-subst">{package.name}</span>...&quot;</span>)
+        dep_local_zip = Path(dep_local_zip)
+        <span class="hljs-keyword">if</span> dep_local != dep_local_zip:
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Archive download location different from specified&quot;</span>)
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{package.name}</span> (<span class="hljs-subst">{dep_url}</span>) already downloaded as <span class="hljs-subst">{dep_local}</span>.&quot;</span>)
+
+    <span class="hljs-keyword">if</span> dep_local <span class="hljs-keyword">and</span> dep_local.exists():
+        <span class="hljs-keyword">def</span> <span class="hljs-title function_">extract_only_when_necessary</span>(<span class="hljs-params">archive : <span class="hljs-type">Union</span>[zipfile.ZipFile, tarfile.TarFile], local_path : Path, target_path : Path, extracted_location : Path</span>) -&gt; <span class="hljs-literal">None</span>:
+            <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> extracted_location.exists():
+                <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;extracting <span class="hljs-subst">{local_path}</span>...&quot;</span>)
+                archive.extractall(target_path)
+                <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;... extracting <span class="hljs-subst">{local_path}</span> complete.&quot;</span>)
+            <span class="hljs-keyword">else</span>:
+                <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Archive <span class="hljs-subst">{local_path}</span> already extracted.&quot;</span>)
+
+        <span class="hljs-keyword">def</span> <span class="hljs-title function_">extract_archive</span>(<span class="hljs-params">archive : <span class="hljs-type">Union</span>[zipfile.ZipFile, tarfile.TarFile]</span>):
+            <span class="hljs-keyword">if</span> <span class="hljs-built_in">type</span>(archive) == zipfile.ZipFile:
+                root = zipfile.Path(archive)
+                children = [p <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> root.iterdir()]
+                <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(children)==<span class="hljs-number">1</span> <span class="hljs-keyword">and</span> children[<span class="hljs-number">0</span>].is_dir():
+                    package.extract_location = build_folder / children[<span class="hljs-number">0</span>].name
+                    target_folder = build_folder
+                <span class="hljs-keyword">else</span>:
+                    stem = dep_local.stem
+                    target_folder = build_folder / stem
+                    package.extract_location = target_folder
+            <span class="hljs-keyword">else</span>:
+                <span class="hljs-keyword">if</span> archive.getmembers()[<span class="hljs-number">0</span>].isdir():
+                    target_folder = build_folder
+                    package.extract_location = target_folder / archive.getmembers()[<span class="hljs-number">0</span>].name
+                <span class="hljs-keyword">else</span>:
+                    stem = dep_local.stem
+                    target_folder = build_folder / stem
+                    package.extract_location = target_folder
+
+            extract_only_when_necessary(archive, dep_local, target_folder, package.extract_location)
+
+        <span class="hljs-keyword">if</span> dep_local.suffix == <span class="hljs-string">&#x27;.zip&#x27;</span>:
+            <span class="hljs-keyword">with</span> zipfile.ZipFile(dep_local, mode=<span class="hljs-string">&#x27;r&#x27;</span>) <span class="hljs-keyword">as</span> dep_zip:
+                extract_archive(dep_zip)
+        <span class="hljs-keyword">else</span>:
+            <span class="hljs-keyword">with</span> tarfile.<span class="hljs-built_in">open</span>(name=dep_local, mode=<span class="hljs-string">&#x27;r:gz&#x27;</span>) <span class="hljs-keyword">as</span> dep_zip:
+                extract_archive(dep_zip)
+
+</code></pre>
+</div></div><p>When the <code>dep_local</code> exists determine the top level element</p>
+<p>Downloading and extracting the source archives use the <code>urllib.request</code>,
+<code>tarfile</code> and <code>zipfile</code> modules. For the type hinting with choice between
+parameter types we use <code>Union</code>, so lets import that too.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;imports&gt;&gt;=+</div><div class="code"><pre><code><span class="hljs-keyword">import</span> urllib.request
+<span class="hljs-keyword">import</span> tarfile
+<span class="hljs-keyword">import</span> zipfile
+<span class="hljs-keyword">from</span> typing <span class="hljs-keyword">import</span> <span class="hljs-type">Union</span>
+</code></pre>
+</div></div><h4>Default no-op patcher</h4>
+<p>If a package does not require any patching the creation of the package instance
+can use the <code>no_patches</code> function instead of having to provide a custom function
+for the patching.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;no patches&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">no_patches</span>(<span class="hljs-params">self : Package</span>):
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;No patches for <span class="hljs-subst">{self.name}</span>&quot;</span>)
+</code></pre>
+</div></div><h4>All Packages</h4>
+<p>As mentioned earlier, all packages need to be defined and registered properly.
+That is done in <code>&lt;&lt;all packages&gt;&gt;</code>. The order of definition does not matter, as
+each package has to express what other packages it depends on. The script will
+automatically create the correct build order through the <code>register_package</code>
+decorator.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;all packages&gt;&gt;=</div><div class="code"><pre><code>&lt;&lt;Boost package&gt;&gt;
+
+&lt;&lt;OpenEXR package&gt;&gt;
+
+&lt;&lt;OpenImageIO package&gt;&gt;
+
+&lt;&lt;zlib package&gt;&gt;
+
+&lt;&lt;libpng package&gt;&gt;
+
+&lt;&lt;embree package&gt;&gt;
+
+&lt;&lt;libtiff package&gt;&gt;
+
+&lt;&lt;libjpeg package&gt;&gt;
+</code></pre>
+</div></div><h3>Building boost</h3>
+<p>The Boost version used is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;Boost version&gt;&gt;=</div><div class="code"><pre><code>boost_version = <span class="hljs-string">&#x27;1.77.0&#x27;</span>
+boost_version_ = boost_version.replace(<span class="hljs-string">&#x27;.&#x27;</span>, <span class="hljs-string">&#x27;_&#x27;</span>)
+</code></pre>
+</div></div><p>With the Boost version we can determine the correct download location</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;Boost download location&gt;&gt;=</div><div class="code"><pre><code>boost_url = <span class="hljs-string">f&#x27;https://boostorg.jfrog.io/artifactory/main/release/<span class="hljs-subst">{boost_version}</span>/source/boost_<span class="hljs-subst">{boost_version_}</span>.zip&#x27;</span>
+</code></pre>
+</div></div><p>Download the Boost archive and extract it. The file will be downloaded to the
+dl_folder. After downloading its content is extracted to the <code>build_folder</code>.
+Since the ZIP file top member is a folder there is no need to specify a separate
+sub-folder under <code>build_folder</code>.</p>
+<h4>The boost builder</h4>
+<p>To build boost it needs to be bootstrapped with the <code>bootstrap</code> script. After
+the bootstrapping has been completed the proper version can be built with <code>b2</code>.</p>
+<p>Building will be done to <code>boost_build</code> under <code>build_folder</code>.</p>
+<p>On MacOS the <code>bootstrap</code> and <code>build.sh</code> scripts needs to have its permissions
+set so that it can be executed.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;boost builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">boost_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    already_built = build_folder / <span class="hljs-string">&#x27;boost.built&#x27;</span>
+
+    boost_install = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;boost_install&#x27;</span>
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        <span class="hljs-keyword">if</span> boost_install.exists():
+            folder_recursive_delete(boost_install)
+        boost_install.mkdir()
+
+        <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> on_macos:
+            bootstrap = [<span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location / <span class="hljs-string">&#x27;bootstrap.bat&#x27;</span> }</span>&quot;</span>]
+            b2exe = <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location / <span class="hljs-string">&#x27;b2.exe&#x27;</span> }</span>&quot;</span>
+            toolsets = [<span class="hljs-string">&#x27;14.1&#x27;</span>, <span class="hljs-string">&#x27;14.2&#x27;</span>]
+        <span class="hljs-keyword">else</span>:
+            bootstrap = [<span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location / <span class="hljs-string">&#x27;bootstrap.sh&#x27;</span> }</span>&quot;</span>]
+            buildsh = <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location / <span class="hljs-string">&#x27;tools/build/src/engine/build.sh&#x27;</span> }</span>&quot;</span>
+            b2exe = <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location / <span class="hljs-string">&#x27;b2&#x27;</span> }</span>&quot;</span>
+            chmod_process = subprocess.run([<span class="hljs-string">&#x27;chmod&#x27;</span>, <span class="hljs-string">&#x27;u+x&#x27;</span>, bootstrap[<span class="hljs-number">0</span>], buildsh])
+            <span class="hljs-keyword">if</span> chmod_process.returncode!=<span class="hljs-number">0</span>:
+                <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Could not change bootstrap.sh permissions.&quot;</span>)
+                <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;Problem setting bootstrap.sh permissions.&quot;</span>)
+            toolsets = [<span class="hljs-string">&#x27;clang&#x27;</span>]
+
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Bootstrapping Boost... &quot;</span>)
+        bootstrap_process = subprocess.run(bootstrap, cwd=self.extract_location, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> bootstrap_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Problem bootstrapping Boost:&quot;</span>)
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{bootstrap_process.stdout}</span>&quot;</span>)
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{bootstrap_process.stderr}</span>&quot;</span>)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;Problem bootstrapping Boost.&quot;</span>)
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Bootstrapping Boost complete.&quot;</span>)
+
+
+        variants = [<span class="hljs-string">&#x27;release&#x27;</span>, <span class="hljs-string">&#x27;debug&#x27;</span>]
+        <span class="hljs-keyword">for</span> toolset <span class="hljs-keyword">in</span> toolsets:
+            <span class="hljs-keyword">for</span> variant <span class="hljs-keyword">in</span> variants:
+                boost_build = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">f&#x27;boost_build<span class="hljs-subst">{variant}</span>&#x27;</span>
+                boost_stage = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">f&#x27;boost_stage<span class="hljs-subst">{variant}</span>&#x27;</span>
+                <span class="hljs-keyword">if</span> boost_build.exists():
+                    folder_recursive_delete(boost_build)
+                boost_build.mkdir()
+                <span class="hljs-keyword">if</span> boost_stage.exists():
+                    folder_recursive_delete(boost_stage)
+                boost_stage.mkdir()
+
+                boostbuild= [
+                    b2exe,
+                    <span class="hljs-string">&quot;-d+2&quot;</span>,
+                    <span class="hljs-string">&quot;-q&quot;</span>,
+                    <span class="hljs-string">f&quot;--prefix=<span class="hljs-subst">{boost_install}</span>&quot;</span>,
+                    <span class="hljs-string">&quot;--no-cmake-config&quot;</span>,
+                    <span class="hljs-string">f&quot;--stagedir=<span class="hljs-subst">{boost_stage}</span>&quot;</span>,
+                    <span class="hljs-string">&quot;--build-type=minimal&quot;</span>,
+                    <span class="hljs-string">f&quot;--build-dir=<span class="hljs-subst">{boost_build}</span>&quot;</span>,
+                    <span class="hljs-string">&quot;--layout=tagged&quot;</span>,
+                    <span class="hljs-string">f&quot;--buildid=RH-<span class="hljs-subst">{toolset.replace(<span class="hljs-string">&#x27;.&#x27;</span>, <span class="hljs-string">&#x27;&#x27;</span>)}</span>&quot;</span> <span class="hljs-keyword">if</span> on_macos <span class="hljs-keyword">else</span> <span class="hljs-string">f&quot;--buildid=RH-v<span class="hljs-subst">{toolset.replace(<span class="hljs-string">&#x27;.&#x27;</span>, <span class="hljs-string">&#x27;&#x27;</span>)}</span>&quot;</span>,
+                    <span class="hljs-string">f&quot;variant=<span class="hljs-subst">{variant}</span>&quot;</span>,
+                    <span class="hljs-string">&quot;warnings=off&quot;</span>,
+                    <span class="hljs-string">f&quot;toolset=<span class="hljs-subst">{toolset}</span>&quot;</span> <span class="hljs-keyword">if</span> on_macos <span class="hljs-keyword">else</span> <span class="hljs-string">f&quot;toolset=msvc-<span class="hljs-subst">{toolset}</span>&quot;</span>,
+                    <span class="hljs-string">&quot;link=shared&quot;</span>,
+                    <span class="hljs-string">&quot;threading=multi&quot;</span>,
+                    <span class="hljs-string">&quot;runtime-link=shared&quot;</span>,
+                    <span class="hljs-string">&quot;address-model=64&quot;</span>,
+                    <span class="hljs-string">&quot;--with-date_time&quot;</span>,
+                    <span class="hljs-string">&quot;--with-chrono&quot;</span>,
+                    <span class="hljs-string">&quot;--with-filesystem&quot;</span>,
+                    <span class="hljs-string">&quot;--with-locale&quot;</span>,
+                    <span class="hljs-string">&quot;--with-regex&quot;</span>,
+                    <span class="hljs-string">&quot;--with-system&quot;</span>,
+                    <span class="hljs-string">&quot;--with-thread&quot;</span>,
+                    <span class="hljs-string">&quot;--with-serialization&quot;</span>,
+                    <span class="hljs-string">&quot;stage&quot;</span>,
+                    <span class="hljs-string">&quot;install&quot;</span>
+                ]
+
+                <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Building Boost: <span class="hljs-subst">{toolset}</span>, <span class="hljs-subst">{variant}</span>... &quot;</span>)
+                boostbuild_process = subprocess.run(boostbuild, cwd=self.extract_location, capture_output=<span class="hljs-literal">True</span>)
+                <span class="hljs-keyword">if</span> boostbuild_process.returncode!=<span class="hljs-number">0</span>:
+                    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Problem building Boost, <span class="hljs-subst">{toolset}</span>, <span class="hljs-subst">{variant}</span>:&quot;</span>)
+                    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{boostbuild_process.stdout}</span>&quot;</span>)
+                    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;<span class="hljs-subst">{boostbuild_process.stderr}</span>&quot;</span>)
+                    <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">f&quot;Problem building Boost. <span class="hljs-subst">{toolset}</span>, <span class="hljs-subst">{variant}</span>&quot;</span>)
+                <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Building Boost complete. <span class="hljs-subst">{toolset}</span>, <span class="hljs-subst">{variant}</span>&quot;</span>)
+        already_built.touch()
+</code></pre>
+</div></div><div class="codefragment"><div class="fragmentname">&lt;&lt;Boost package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">boost</span>():
+    &lt;&lt;Boost version&gt;&gt;
+    &lt;&lt;Boost download location&gt;&gt;
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">boost_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+        boost_inc = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;boost_install&#x27;</span> / <span class="hljs-string">&#x27;include&#x27;</span>
+        boost_inc = boost_inc.resolve()
+        <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{boost_inc}</span>&quot;</span>
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">boost_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+        boost_lib = (self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;boost_install&#x27;</span> / <span class="hljs-string">&#x27;lib&#x27;</span>).resolve()
+        <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{boost_lib}</span>&quot;</span>
+
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">boost_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+        <span class="hljs-keyword">pass</span>
+
+    &lt;&lt;boost builder&gt;&gt;
+
+    boost_local = dl_folder / <span class="hljs-string">f&#x27;boost_<span class="hljs-subst">{boost_version_}</span>.zip&#x27;</span>
+
+    boost_dep = Package(<span class="hljs-string">&quot;Boost&quot;</span>, boost_version, boost_url, boost_local,
+                            download_and_extract_package,
+                            boost_include_dir, boost_library_dir, no_patches,
+                            boost_build, boost_package,
+                            [], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> boost_dep
+</code></pre>
+</div></div><h3>Building OpenEXR</h3>
+<p>The version of OpenEXR needed is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;OpenEXR version&gt;&gt;=</div><div class="code"><pre><code>openexr_version = <span class="hljs-string">&#x27;2.5.5&#x27;</span>
+</code></pre>
+</div></div><p>The location from where the OpenEXR source archive is download is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;OpenEXR download location&gt;&gt;=</div><div class="code"><pre><code>openexr_url = <span class="hljs-string">f&#x27;https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v<span class="hljs-subst">{openexr_version}</span>.zip&#x27;</span>
+</code></pre>
+</div></div><p>The OpenEXR archive is extracted to the <code>build_folder</code>. There are no patches to
+be applied, so we can concentrate on just configuring and building OpenEXR. From
+OpenEXR 2.5 onward the library is split up into separate parts: <code>IlmBase</code>,
+<code>OpenEXR</code> and <code>PyIlmBase</code>. We don't need the Python bindings, therefor we pass
+to <code>cmake</code> the setting <code>-DPYILMBASE_ENABLE=OFF</code>.</p>
+<p>We also want to prevent clashes with other software that may use OpenEXR. To
+that end we use a custom library prefix <code>-RH-2_5</code> instead of the regular <code>-2_5</code>.
+This should ensure ability to load Rhino inside software that happen to be using
+the same library but from a different location.</p>
+<p>Since for <code>cmake</code> projects it is good practice to build and install outside of
+the source directory we will use two folders, <code>openexr_build</code> and
+<code>openexr_install</code> for this. These are created in the <code>build_folder</code> for this
+run.</p>
+<p>To build OpenEXR the zlib linking library and include directory are needed as
+well, so ensure we fetch those and pass them along on the <code>cmake</code> command-line.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;openexr builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">openexr_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    already_built = build_folder / <span class="hljs-string">&#x27;openexr.built&#x27;</span>
+    <span class="hljs-comment"># we shouldn&#x27;t build in the source directory (extract_location)</span>
+    build_dir = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;openexr_build&#x27;</span>
+    install_dir = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;openexr_install&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        <span class="hljs-keyword">if</span> build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        <span class="hljs-keyword">if</span> install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> packages:
+            <span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;zlib&#x27;</span>:
+                zlib_library = Path(p.get_library_dir(p))
+                zlib_include_dir = Path(p.get_include_dir(p))
+
+        openexr_config_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_SYSTEM_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_INSTALL_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">&#x27;-DOPENEXR_LIB_SUFFIX=-RH-2_5&#x27;</span>,
+            <span class="hljs-string">&#x27;-DILMBASE_LIB_SUFFIX=-RH-2_5&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DZLIB_LIBRARY=<span class="hljs-subst">{zlib_library}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DZLIB_INCLUDE_DIR=<span class="hljs-subst">{zlib_include_dir}</span>&#x27;</span>,
+            <span class="hljs-string">&#x27;-DPYILMBASE_ENABLE=OFF&#x27;</span>,
+            <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+        ]
+
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Configuring OpenEXR&quot;</span>)
+        openexr_config_process = subprocess.run(openexr_config_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> openexr_config_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(openexr_config_process.stdout)
+            <span class="hljs-built_in">print</span>(openexr_config_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;OpenEXR configuration failed&quot;</span>)
+
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;OpenEXR configured.&quot;</span>)
+
+        openexr_build_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;--build&#x27;</span>,
+            <span class="hljs-string">&#x27;.&#x27;</span>,
+            <span class="hljs-string">&#x27;--target&#x27;</span>,
+            <span class="hljs-string">&#x27;install&#x27;</span>,
+            <span class="hljs-string">&#x27;--config&#x27;</span>,
+            <span class="hljs-string">&#x27;Release&#x27;</span>
+        ]
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Building OpenEXR&quot;</span>)
+        openexr_build_process = subprocess.run(openexr_build_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> openexr_build_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(openexr_build_process.stdout)
+            <span class="hljs-built_in">print</span>(openexr_build_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;OpenEXR build failed&quot;</span>)
+
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;OpenEXR built.&quot;</span>)
+
+        already_built.touch()
+</code></pre>
+</div></div><div class="codefragment"><div class="fragmentname">&lt;&lt;OpenEXR package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">openexr_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    install_dir = (self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;openexr_install&#x27;</span> / <span class="hljs-string">&#x27;include&#x27;</span>).resolve()
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{install_dir}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">openexr_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">openexr_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">pass</span>
+
+&lt;&lt;openexr builder&gt;&gt;
+<span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">openexr</span>():
+    &lt;&lt;OpenEXR version&gt;&gt;
+    &lt;&lt;OpenEXR download location&gt;&gt;
+    openexr_local = dl_folder / <span class="hljs-string">f&#x27;openexr_<span class="hljs-subst">{openexr_version}</span>.zip&#x27;</span>
+    openexr_dep = Package(<span class="hljs-string">&quot;OpenEXR&quot;</span>, openexr_version, openexr_url, openexr_local,
+                            download_and_extract_package,
+                            openexr_include_dir, openexr_library_dir, no_patches,
+                            openexr_build, openexr_package,
+                            [<span class="hljs-string">&#x27;zlib&#x27;</span>], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> openexr_dep
+</code></pre>
+</div></div><h3>Building  OpenImageIO</h3>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;oiio version&gt;&gt;=</div><div class="code"><pre><code>oiio_version = <span class="hljs-string">&#x27;2.2.19.0&#x27;</span>
+</code></pre>
+</div></div><p>The download location of oiio is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;oiio download location&gt;&gt;=</div><div class="code"><pre><code>oiio_url = <span class="hljs-string">f&#x27;https://github.com/OpenImageIO/oiio/archive/refs/tags/v<span class="hljs-subst">{oiio_version}</span>.zip&#x27;</span>
+</code></pre>
+</div></div><p>The <code>oiio</code> library</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;OpenImageIO package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">oiio_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">oiio_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">oiio_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">pass</span>
+
+&lt;&lt;oiio builder&gt;&gt;
+
+<span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">oiio</span>():
+    &lt;&lt;oiio version&gt;&gt;
+    &lt;&lt;oiio download location&gt;&gt;
+    oiio_local = dl_folder / <span class="hljs-string">f&#x27;OpenImageIOv<span class="hljs-subst">{oiio_version}</span>.zip&#x27;</span>
+    oiio_dep = Package(<span class="hljs-string">&quot;OpenImageIO&quot;</span>, oiio_version, oiio_url, oiio_local,
+                            download_and_extract_package,
+                            oiio_include_dir, oiio_library_dir, no_patches,
+                            oiio_build, oiio_package,
+                            [<span class="hljs-string">&quot;openexr&quot;</span>, <span class="hljs-string">&quot;boost&quot;</span>, <span class="hljs-string">&quot;libpng&quot;</span>, <span class="hljs-string">&quot;libtiff&quot;</span>, <span class="hljs-string">&quot;libjpeg&quot;</span>], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> oiio_dep
+</code></pre>
+</div></div><h4>OpenImageIO builder</h4>
+<p>The actual building of <code>oiio</code> is handled in <code>&lt;&lt;oiio builder&gt;&gt;</code>. The build starts
+by configuring the project with CMake. Once the configuration is complete CMake
+is used to guide the actual build process.</p>
+<p>Building and distribution preparation are done outside of the source folder.
+This is done by creating <code>build_dir</code> and <code>install_dir</code> variables that hold the
+correct locations.</p>
+<p><strong>TODO</strong>: Add way to get version number from package.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;oiio builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">oiio_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    already_built = build_folder / <span class="hljs-string">&#x27;oiio.built&#x27;</span>
+    build_dir = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;oiio_build&#x27;</span>
+    install_dir = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;oiio_install&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        <span class="hljs-keyword">if</span> build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        <span class="hljs-keyword">if</span> install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        &lt;&lt;gather oiio dependencies&gt;&gt;
+        &lt;&lt;configure oiio <span class="hljs-keyword">with</span> cmake&gt;&gt;
+
+        oiio_build_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;--build&#x27;</span>,
+            <span class="hljs-string">&#x27;.&#x27;</span>,
+            <span class="hljs-string">&#x27;--target&#x27;</span>,
+            <span class="hljs-string">&#x27;install&#x27;</span>,
+            <span class="hljs-string">&#x27;--config&#x27;</span>,
+            <span class="hljs-string">&#x27;Release&#x27;</span>
+        ]
+        oiio_build_process = subprocess.run(oiio_build_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> oiio_build_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(oiio_build_process.stdout)
+            <span class="hljs-built_in">print</span>(oiio_build_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;OpenImageIO build failed&quot;</span>)
+        <span class="hljs-keyword">else</span>:
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;OpenImageIO built&quot;</span>)
+
+        already_built.touch()
+</code></pre>
+</div></div><h4>OpenImageIO dependencies</h4>
+<p>The OpenImageIO library is built against dependencies managed by this script.To
+ensure these are used properly we need to harvest all necessary data to pass on
+to the CMake configuration step.</p>
+<p>The Zlib, libTIFF, libJPEG and OpenEXR dependencies don't need special care, as for those we can directly ask each respective package for the library and root paths.</p>
+<p>The Boost dependency, however, needs some extra attention.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;gather oiio dependencies&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> packages:
+    <span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;zlib&#x27;</span>:
+        zlib_library = p.get_library_dir(p)
+        zlib_root = p.get_include_dir(p)
+    <span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;libtiff&#x27;</span>:
+        libtiff_include = p.get_include_dir(p)
+        libtiff_root = (Path(libtiff_include) / <span class="hljs-string">&#x27;..&#x27;</span>) .resolve()
+    <span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;openexr&#x27;</span>:
+        openexr_root = (Path(p.get_include_dir(p)) / <span class="hljs-string">&#x27;..&#x27;</span> ) .resolve()
+    <span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;libjpeg&#x27;</span>:
+        libjpeg_include = p.get_include_dir(p)
+        libjpeg_root = (Path(libjpeg_include) / <span class="hljs-string">&#x27;..&#x27;</span> ) .resolve()
+    &lt;&lt;boost <span class="hljs-keyword">for</span> oiio&gt;&gt;
+</code></pre>
+</div></div><h5>Boost dependency</h5>
+<p>OpenImageIO needs Boost. We need the location of the linking libraries and the
+headers. The libraries linked against on Windows have in their name the toolset
+<code>v142</code> and end in <code>.lib</code>. In contrast on MacOS the toolset is <code>clang</code>, the
+library names are prefixed with <code>lib</code> and end in <code>.dylib</code>.</p>
+<p>Remember from the Boost configuration section that we tag our builds of the
+libraries with 'RH'.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;boost for oiio&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;boost&#x27;</span>:
+    boost_library_dir = p.get_library_dir(p)
+    boost_include_dir = p.get_include_dir(p)
+    boost_root = Path(boost_include_dir) / <span class="hljs-string">&#x27;..&#x27;</span>
+    boost_root = boost_root.resolve()
+    <span class="hljs-keyword">if</span> on_macos:
+        prefix = <span class="hljs-string">&#x27;lib&#x27;</span>
+        postfix = <span class="hljs-string">&#x27;clang.dylib&#x27;</span>
+    <span class="hljs-keyword">else</span>:
+        prefix = <span class="hljs-string">&#x27;&#x27;</span>
+        postfix = <span class="hljs-string">&#x27;v141.lib&#x27;</span>
+
+    _boost_libraries = [
+        <span class="hljs-string">&#x27;boost_atomic-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_chrono-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_date_time-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_filesystem-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_locale-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_regex-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_serialization-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_system-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_thread-mt-x64-RH-&#x27;</span>,
+        <span class="hljs-string">&#x27;boost_wserialization-mt-x64-RH-&#x27;</span>
+    ]
+    boost_libraries = <span class="hljs-string">&#x27;;&#x27;</span>.join([<span class="hljs-string">f&#x27;<span class="hljs-subst">{prefix}</span><span class="hljs-subst">{lib}</span><span class="hljs-subst">{postfix}</span>&#x27;</span> <span class="hljs-keyword">for</span> lib <span class="hljs-keyword">in</span> _boost_libraries])
+</code></pre>
+</div></div><h4>Configuring OpenImageIO with CMake</h4>
+<p>To ensure OpenImageIO is not built with support for dependencies we haven't
+built ourselves we need to explicitly disable everything else. This is
+especially important on MacOS systems, since it is easy to have potential
+dependencies installed through <code>homebrew</code>.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;explicitly turned off oiio features&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-string">&#x27;-DUSE_PTHREAD=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DUSE_PYTHON=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DUSE_CCACHE=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DOIIO_BUILD_TOOLS=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DOIIO_BUILD_TESTS=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DBUILD_TESTING=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DBUILD_DOCS=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DBUILD_FMT_FORCE=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DBUILD_MISSING_DEPS=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DINSTALL_DOCS=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DINSTALL_FONTS=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DOIIO_THREAD_ALLOW_DCLP=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_GIF=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_BZIP2=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_FREETYPE=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_HDF5=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_LIBHEIF=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_LibRaw=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_OPENGL=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_OPENGL_gl=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_OPENGL_glu=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_OPENJPEG=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_OpenCV=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_Ptex=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_Qt5=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_LBSQUISH=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_NUKE_DOIMAGE=OFF&#x27;</span>,
+<span class="hljs-string">&#x27;-DENABLE_WEBP=OFF&#x27;</span>,
+</code></pre>
+</div></div><p><strong>Note</strong> Always check the resulting OpenImageIO libraries with dependency walker
+on Windows and with <code>otool -L</code> on MacOS what the built in dependencies are.
+Especially after updating OpenImageIO source code to a newer version great care
+must be taken no new unnoticed dependencies get pulled in.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;configure oiio with cmake&gt;&gt;=</div><div class="code"><pre><code>oiio_config_cmake = [
+    <span class="hljs-string">&#x27;cmake&#x27;</span>,
+    <span class="hljs-string">&#x27;-DCMAKE_VERBOSE_MAKEFILE=ON&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DCMAKE_SYSTEM_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DCMAKE_INSTALL_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+    &lt;&lt;explicitly turned off oiio features&gt;&gt;
+    <span class="hljs-string">&#x27;-DOIIO_LIBNAME_SUFFIX=RH&#x27;</span>,
+    <span class="hljs-string">&#x27;-DLINKSTATIC=ON&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DZLIB_ROOT=<span class="hljs-subst">{zlib_root}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DZLIB_LIBRARY_DEBUG=<span class="hljs-subst">{zlib_library}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DZLIB_LIBRARY_RELEASE=<span class="hljs-subst">{zlib_library}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DBoost_ROOT=<span class="hljs-subst">{boost_root}</span>&#x27;</span>,
+    <span class="hljs-string">&#x27;-DBOOST_CUSTOM=ON&#x27;</span>,
+    <span class="hljs-string">&#x27;-DBoost_VERSION=1.77&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DBoost_INCLUDE_DIRS=<span class="hljs-subst">{boost_include_dir}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DBoost_LIBRARY_DIRS=<span class="hljs-subst">{boost_library_dir}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DBoost_LIBRARIES=<span class="hljs-subst">{boost_libraries}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DOpenEXR_ROOT=<span class="hljs-subst">{openexr_root}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DTIFF_ROOT=<span class="hljs-subst">{libtiff_root}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DJPEG_INCLUDE_DIR=<span class="hljs-subst">{libjpeg_include}</span>&#x27;</span>,
+    <span class="hljs-string">f&#x27;-DJPEG_ROOT=<span class="hljs-subst">{libjpeg_root}</span>&#x27;</span>,
+    <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+]
+
+<span class="hljs-built_in">print</span>(oiio_config_cmake)
+
+oiio_config_process = subprocess.run(oiio_config_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+<span class="hljs-keyword">if</span> oiio_config_process.returncode!=<span class="hljs-number">0</span>:
+    <span class="hljs-built_in">print</span>(oiio_config_process.stdout)
+    <span class="hljs-built_in">print</span>(oiio_config_process.stderr)
+    <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;OpenImageIO configuration failed&quot;</span>)
+<span class="hljs-keyword">else</span>:
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;OpenImageIO configured.&quot;</span>)
+</code></pre>
+</div></div><h3>Building zlib</h3>
+<p>The zlib version used is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;zlib version&gt;&gt;=</div><div class="code"><pre><code>zlib_version = <span class="hljs-string">&#x27;1.2.11&#x27;</span>
+zlib_version_n = zlib_version.replace(<span class="hljs-string">&#x27;.&#x27;</span>, <span class="hljs-string">&#x27;&#x27;</span>)
+</code></pre>
+</div></div><p>The download location of zlib is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;zlib download location&gt;&gt;=</div><div class="code"><pre><code>zlib_url = <span class="hljs-string">f&#x27;https://www.zlib.net/zlib<span class="hljs-subst">{zlib_version_n}</span>.zip&#x27;</span>
+</code></pre>
+</div></div><p>The <code>zlib</code> library</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;zlib package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">if</span> on_macos:
+        <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{Path(self.extract_location) / <span class="hljs-string">&#x27;libz.a&#x27;</span>}</span>&quot;</span>
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{Path(self.extract_location) / <span class="hljs-string">&#x27;contrib&#x27;</span> / <span class="hljs-string">&#x27;vstudio&#x27;</span> / <span class="hljs-string">&#x27;vc14&#x27;</span> / <span class="hljs-string">&#x27;x64&#x27;</span> / <span class="hljs-string">&#x27;ZlibStatRelease&#x27;</span> / <span class="hljs-string">&#x27;zlibstat.lib&#x27;</span>}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">pass</span>
+
+&lt;&lt;zlib patcher&gt;&gt;
+
+&lt;&lt;zlib windows builder&gt;&gt;
+
+&lt;&lt;zlib macos builder&gt;&gt;
+
+&lt;&lt;zlib builder&gt;&gt;
+
+<span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib</span>():
+    &lt;&lt;zlib version&gt;&gt;
+    &lt;&lt;zlib download location&gt;&gt;
+    zlib_local = dl_folder / <span class="hljs-string">f&#x27;zlib_<span class="hljs-subst">{zlib_version}</span>.zip&#x27;</span>
+    zlib_dep = Package(<span class="hljs-string">&quot;zlib&quot;</span>, zlib_version, zlib_url, zlib_local,
+                            download_and_extract_package,
+                            zlib_include_dir, zlib_library_dir, zlib_patch,
+                            zlib_build, zlib_package,
+                            [], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> zlib_dep
+</code></pre>
+</div></div><h4>Patching zlib</h4>
+<p>To be able to build <code>zlib</code> on Windows the source archive needs to be patched.
+This is for the project files. The source archive provides for vs14, but we use
+vs16. On MacOS the source code does not need patching.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;zlib patcher&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib_patch</span>(<span class="hljs-params">self</span>):
+    <span class="hljs-keyword">if</span> on_macos:
+        <span class="hljs-keyword">return</span>
+
+    patch_file = current_path / <span class="hljs-string">&#x27;patches&#x27;</span> / <span class="hljs-string">&#x27;zlib_build_system.patch&#x27;</span>
+    patch_file_applied = build_folder / <span class="hljs-string">&#x27;zlib_build_system.patch.applied&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> patch_file_applied.exists():
+        patch_command = [
+            <span class="hljs-string">&#x27;git&#x27;</span>,
+            <span class="hljs-string">&#x27;apply&#x27;</span>,
+            <span class="hljs-string">&#x27;--ignore-space-change&#x27;</span>,
+            <span class="hljs-string">&#x27;--ignore-whitespace&#x27;</span>,
+            <span class="hljs-string">&#x27;--whitespace=nowarn&#x27;</span>,
+            <span class="hljs-string">&#x27;-p1&#x27;</span>,
+            <span class="hljs-string">f&quot;<span class="hljs-subst">{patch_file}</span>&quot;</span>
+        ]
+        patch_process = subprocess.run(patch_command, cwd=self.extract_location, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> patch_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(patch_process.stderr)
+            <span class="hljs-built_in">print</span>(patch_process.stdout)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;Zlib patching failed.&quot;</span>)
+        <span class="hljs-built_in">print</span>(patch_process.stdout)
+        patch_file_applied.touch()
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Zlib patch successfully applied.&quot;</span>)
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Zlib patch already applied.&quot;</span>)
+</code></pre>
+</div></div><h4>Building it</h4>
+<p>The <code>zlib</code> library needs to built in two distinct ways on the supported
+platforms. The build logic is handled in <code>zlib_build_macos()</code> and
+<code>zlib_build_windows()</code> methods that are defined in the fragments <code>&lt;&lt;zlib macos builder&gt;&gt;</code> and <code>&lt;&lt;zlib windows builder&gt;&gt;</code> respectively.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;zlib builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;=&quot;</span>*<span class="hljs-number">20</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;\nBuilding <span class="hljs-subst">{self.name}</span>&quot;</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;For <span class="hljs-subst">{self.name}</span> extract location: <span class="hljs-subst">{self.extract_location}</span>&quot;</span>)
+
+    <span class="hljs-keyword">if</span> on_macos:
+        zlib_build_macos(self)
+    <span class="hljs-keyword">else</span>:
+        zlib_build_windows(self)
+</code></pre>
+</div></div><h5>Building on Windows</h5>
+<p>The actual building of <code>zlib</code> is handled in <code>&lt;&lt;zlib builder&gt;&gt;</code>. The build solution needed is under <code>{extract_location}/contrib/vstudio/vc14</code>. The project we want to build is for the static library of zlib, <code>zlibstat</code>. Configuration will be <code>x64</code>.</p>
+<p>There are two functions implemented in assembly, so these need to be built
+first. The batch file <code>bld_ml64.bat</code> will do that. Ensure that you have access
+to MASM (<code>ml64.exe</code>).</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;zlib windows builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib_build_windows</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    already_built = build_folder / <span class="hljs-string">&#x27;zlib.built&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        asmcode = self.extract_location / <span class="hljs-string">&#x27;contrib&#x27;</span> / <span class="hljs-string">&#x27;masmx64&#x27;</span> / <span class="hljs-string">&#x27;bld_ml64.bat&#x27;</span>
+        asmcode_wd = asmcode.parent
+        sln = self.extract_location / <span class="hljs-string">&#x27;contrib&#x27;</span> / <span class="hljs-string">&#x27;vstudio&#x27;</span> / <span class="hljs-string">&#x27;vc14&#x27;</span> / <span class="hljs-string">&#x27;zlibvc.sln&#x27;</span>
+
+        build_settings = [<span class="hljs-string">f&quot;<span class="hljs-subst">{msbuild}</span>&quot;</span>,
+                        <span class="hljs-string">f&quot;<span class="hljs-subst">{sln}</span>&quot;</span>,
+                        <span class="hljs-string">&quot;/t:zlibstat&quot;</span>,
+                        <span class="hljs-string">&quot;/p:Configuration=Release&quot;</span>,
+                        <span class="hljs-string">&quot;/p:Platform=x64&quot;</span>,
+                        <span class="hljs-string">&quot;/m&quot;</span>
+        ]
+
+        <span class="hljs-built_in">print</span>(build_settings)
+
+        asm_process = subprocess.run([<span class="hljs-string">f&quot;<span class="hljs-subst">{asmcode}</span>&quot;</span>], cwd=<span class="hljs-string">f&quot;<span class="hljs-subst">{asmcode_wd}</span>&quot;</span>, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-built_in">print</span>(asm_process.stdout)
+
+        completed_process = subprocess.run(build_settings, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-built_in">print</span>(completed_process.stdout)
+
+
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;Use <span class="hljs-subst">{sln}</span>, <span class="hljs-subst">{sln.exists()}</span>&quot;</span>)
+        already_built.touch()
+
+</code></pre>
+</div></div><h5>Building on MacOS</h5>
+<p>On MacOS first the <code>configure</code> script needs to be run. The <code>zlib</code> library is
+needed as a static library, and built for 64-bit architecture. This is done with
+the options <code>--static</code> and <code>--64</code> respectively.</p>
+<p>To be able to run the <code>configure</code> script it needs to be given the correct
+permissions which is done through executing <code>chmod u+x</code> on it.</p>
+<p>Once the configuration is complete the library can be built using <code>make</code>.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;zlib macos builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">zlib_build_macos</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    already_built = build_folder / <span class="hljs-string">&#x27;zlib.built&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        configure = self.extract_location / <span class="hljs-string">&#x27;configure&#x27;</span>
+
+        build_settings = [<span class="hljs-string">f&quot;<span class="hljs-subst">{configure}</span>&quot;</span>,
+                        <span class="hljs-string">&quot;--static&quot;</span>,
+                        <span class="hljs-string">&quot;--64&quot;</span>
+        ]
+
+        <span class="hljs-built_in">print</span>(build_settings)
+
+        chmod_process = subprocess.run([<span class="hljs-string">&#x27;chmod&#x27;</span>, <span class="hljs-string">&#x27;u+x&#x27;</span>, configure], cwd=<span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+
+        configure_process = subprocess.run(build_settings, cwd=<span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-built_in">print</span>(configure_process.stdout)
+
+        make_process = subprocess.run([<span class="hljs-string">&#x27;make&#x27;</span>], cwd=<span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-built_in">print</span>(make_process.stdout)
+
+        already_built.touch()
+
+</code></pre>
+</div></div><h3>Building libpng</h3>
+<p>The libpng version used is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libpng version&gt;&gt;=</div><div class="code"><pre><code>libpng_version = <span class="hljs-string">&#x27;1.6.37&#x27;</span>
+libpng_version_n = libpng_version.replace(<span class="hljs-string">&#x27;.&#x27;</span>, <span class="hljs-string">&#x27;&#x27;</span>)
+</code></pre>
+</div></div><p>The download location of libpng is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libpng download location&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-comment">#libpng_url = f&#x27;https://downloads.sourceforge.net/project/libpng/libpng16/1.6.37/lpng1637.zip?ts=gAAAAABhcdxHiIQEppu8-oHTz9BTr3p2tJM_DeS4-wTGyGlS-kXzOZEPyiS_chMS85CqLLmKuoeYL0KiRykk2btl3edJf2E_tw%3D%3D&amp;r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Flibpng%2Ffiles%2Flibpng16%2F1.6.37%2Flpng1637.zip%2Fdownload%3Fuse_mirror%3Daltushost-swe&#x27;</span>
+
+libpng_url = <span class="hljs-string">&#x27;https://downloads.sourceforge.net/project/libpng/libpng16/1.6.37/libpng-1.6.37.tar.gz?ts=gAAAAABhvF0oil3-kb0cblcm84Gl5XI3czxVE87TaeARn56PerrRwPViMRERvr8KKWSi88uy4gmoj9J6ZolV4oQw8CQSDfIf5Q%3D%3D&amp;r=https%3A%2F%2Fsourceforge.net%2Fprojects%2Flibpng%2Ffiles%2Flibpng16%2F1.6.37%2Flibpng-1.6.37.tar.gz%2Fdownload&#x27;</span>
+</code></pre>
+</div></div><p>A small patch to the build system needs to be applied before we can build the <code>libpng</code> library. There is really only one change needed: setting the correct path to the <code>zlib</code> location.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libpng patcher&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng_patch</span>(<span class="hljs-params">self</span>):
+    patch_file = current_path / <span class="hljs-string">&#x27;patches&#x27;</span> / <span class="hljs-string">&#x27;lpng_build_system.patch&#x27;</span>
+    patch_file_applied = build_folder / <span class="hljs-string">&#x27;lpng_build_system.patch.applied&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> patch_file_applied.exists():
+        patch_command = [
+            <span class="hljs-string">&#x27;git&#x27;</span>,
+            <span class="hljs-string">&#x27;apply&#x27;</span>,
+            <span class="hljs-string">&#x27;--ignore-space-change&#x27;</span>,
+            <span class="hljs-string">&#x27;--ignore-whitespace&#x27;</span>,
+            <span class="hljs-string">&#x27;--whitespace=nowarn&#x27;</span>,
+            <span class="hljs-string">&#x27;-p1&#x27;</span>,
+            <span class="hljs-string">f&quot;<span class="hljs-subst">{patch_file}</span>&quot;</span>
+        ]
+
+        patch_process = subprocess.run(patch_command, cwd=self.extract_location, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> patch_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(patch_process.stdout)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;Could not patch PNG&quot;</span>)
+        <span class="hljs-keyword">else</span>:
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;LibPNG patched.&quot;</span>)
+        patch_file_applied.touch()
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;LibPNG already patched.&quot;</span>)
+</code></pre>
+</div></div><h4>The libpng builder</h4>
+<p>Building the <code>libPNG</code> library on both MacOS and Windows require sufficiently
+different approaches that it is split over two specialized buid functions, which
+are presented by <code>&lt;&lt;libpng macos builder&gt;&gt;</code> and <code>&lt;&lt;libpng windows builder&gt;&gt;</code> respectively.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libpng builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;=&quot;</span>*<span class="hljs-number">20</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;\nBuilding <span class="hljs-subst">{self.name}</span>&quot;</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;For <span class="hljs-subst">{self.name}</span> extract location: <span class="hljs-subst">{self.extract_location}</span>&quot;</span>)
+
+    <span class="hljs-keyword">if</span> on_macos:
+        libpng_macos_build(self)
+    <span class="hljs-keyword">else</span>:
+        libpng_windows_build(self)
+
+</code></pre>
+</div></div><h5>LibPNG MacOS builder</h5>
+<p>On MacOS building of <code>libPNG</code> is controlled through CMake. As an additional
+hurdle the files contained in the archive are DOS-style in such a way that it
+actually causes problems. To that end we need to run <code>dos2unix</code> on all extracted
+files of the library archive.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libpng macos builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng_macos_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    already_built = build_folder / <span class="hljs-string">&#x27;libpng.built&#x27;</span>
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;=&quot;</span>*<span class="hljs-number">20</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;\nBuilding <span class="hljs-subst">{self.name}</span>&quot;</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;For <span class="hljs-subst">{self.name}</span> extract location: <span class="hljs-subst">{self.extract_location}</span>&quot;</span>)
+    build_dir = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libpng_build&#x27;</span>
+    install_dir = self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libpng_install&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        <span class="hljs-string">&quot;&quot;&quot;dos2unix = [
+            &quot;find&quot;,
+            &quot;.&quot;,
+            &quot;-type&quot;,
+            &quot;f&quot;,
+            &quot;|&quot;,
+            &quot;xargs&quot;,
+            &quot;dos2unix&quot;
+        ]
+
+        dos2unix_process = subprocess.run(dos2unix, cwd=f&quot;{self.extract_location}&quot;, encoding=&#x27;utf-8&#x27;, universal_newlines=&#x27;\n&#x27;, capture_output=True)
+
+        print(dos2unix_process.stdout)&quot;&quot;&quot;</span>
+
+        <span class="hljs-keyword">if</span> build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        <span class="hljs-keyword">if</span> install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        libpng_config_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;-G&#x27;</span>,
+            <span class="hljs-string">&#x27;Unix Makefiles&#x27;</span> <span class="hljs-keyword">if</span> on_macos <span class="hljs-keyword">else</span> <span class="hljs-string">&#x27;Visual Studio 16 2019&#x27;</span>,
+            <span class="hljs-string">&#x27;-DPNG_TESTS=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DPNG_SHARED=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DAWK=/usr/local/bin/gawk&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_SYSTEM_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_INSTALL_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;<span class="hljs-subst">{self.extract_location}</span>&#x27;</span>
+        ]
+
+        libpng_config_process = subprocess.run(libpng_config_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> libpng_config_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Configuring libPNG failed&quot;</span>)
+            <span class="hljs-built_in">print</span>(libpng_config_process.stdout)
+            <span class="hljs-built_in">print</span>(libpng_config_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;Configuring libPNG failed&quot;</span>)
+        <span class="hljs-keyword">else</span>:
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;libPNG configured&quot;</span>)
+
+
+        make_process = subprocess.run([<span class="hljs-string">&#x27;cmake&#x27;</span>, <span class="hljs-string">&#x27;--build&#x27;</span>, <span class="hljs-string">&#x27;.&#x27;</span>, <span class="hljs-string">&#x27;--target&#x27;</span>, <span class="hljs-string">&#x27;install&#x27;</span>], cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+
+        <span class="hljs-keyword">if</span> make_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;Building libPNG failed&quot;</span>)
+            <span class="hljs-built_in">print</span>(make_process.stdout)
+            <span class="hljs-built_in">print</span>(make_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;Building libPNG failed&quot;</span>)
+
+        already_built.touch()
+</code></pre>
+</div></div><h5>LibPNG Windows builder</h5>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libpng windows builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng_windows_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    already_built = build_folder / <span class="hljs-string">&#x27;libpng.built&#x27;</span>
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;=&quot;</span>*<span class="hljs-number">20</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;\nBuilding <span class="hljs-subst">{self.name}</span>&quot;</span>)
+    <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;For <span class="hljs-subst">{self.name}</span> extract location: <span class="hljs-subst">{self.extract_location}</span>&quot;</span>)
+
+    sln = self.extract_location / <span class="hljs-string">&#x27;projects&#x27;</span> / <span class="hljs-string">&#x27;vstudio&#x27;</span> / <span class="hljs-string">&#x27;vstudio.sln&#x27;</span>
+
+    build_settings = [<span class="hljs-string">f&quot;<span class="hljs-subst">{msbuild}</span>&quot;</span>,
+                      <span class="hljs-string">f&quot;<span class="hljs-subst">{sln}</span>&quot;</span>,
+                      <span class="hljs-string">&quot;/t:libpng&quot;</span>,
+                      <span class="hljs-string">&quot;/p:Configuration=Release Library&quot;</span>,
+                      <span class="hljs-string">&quot;/p:Platform=x64&quot;</span>,
+                      <span class="hljs-string">&quot;/m&quot;</span>
+    ]
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        completed_process = subprocess.run(build_settings, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-built_in">print</span>(completed_process.stdout)
+        already_built.touch()
+</code></pre>
+</div></div><h4>The libPNG package</h4>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libpng package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">pass</span>
+
+&lt;&lt;libpng patcher&gt;&gt;
+
+&lt;&lt;libpng macos builder&gt;&gt;
+
+&lt;&lt;libpng windows builder&gt;&gt;
+
+&lt;&lt;libpng builder&gt;&gt;
+
+<span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libpng</span>():
+    &lt;&lt;libpng version&gt;&gt;
+    &lt;&lt;libpng download location&gt;&gt;
+    libpng_local = dl_folder / <span class="hljs-string">f&#x27;libpng_<span class="hljs-subst">{libpng_version_n}</span>.tar.gz&#x27;</span>
+    libpng_dep = Package(<span class="hljs-string">&quot;libpng&quot;</span>, libpng_version, libpng_url, libpng_local,
+                            download_and_extract_package,
+                            libpng_include_dir, libpng_library_dir, libpng_patch,
+                            libpng_build, libpng_package,
+                            [<span class="hljs-string">&#x27;zlib&#x27;</span>], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> libpng_dep
+</code></pre>
+</div></div><h3>building embree</h3>
+<p>embree is used for tracing in the bvh when it is set to use the embree library. this section handles building of the embree library.</p>
+<p>the version of the embree library used is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;embree version&gt;&gt;=</div><div class="code"><pre><code>embree_version = <span class="hljs-string">&#x27;3.13.2&#x27;</span>
+</code></pre>
+</div></div><p>with this information we can generate the download location of the library from github</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;embree download location&gt;&gt;=</div><div class="code"><pre><code>embree_url = <span class="hljs-string">f&#x27;https://github.com/embree/embree/archive/refs/tags/v<span class="hljs-subst">{embree_version}</span>.zip&#x27;</span>
+</code></pre>
+</div></div><h4>Embree builder</h4>
+<p>building of embree is managed through cmake. currently building is done without the thread building blocks (tbb) library, but that may change in the future.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;embree builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">embree_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-built_in">print</span>(self.extract_location)
+    already_built = build_folder / <span class="hljs-string">&#x27;embree.built&#x27;</span>
+    <span class="hljs-comment"># we shouldn&#x27;t build in the source directory (extract_location)</span>
+    build_dir = (self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;embree_build&#x27;</span>).resolve()
+    install_dir = (self.extract_location / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;embree_install&#x27;</span>).resolve()
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        <span class="hljs-keyword">if</span> build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        <span class="hljs-keyword">if</span> install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        tasking_system = <span class="hljs-string">&#x27;INTERNAL&#x27;</span> <span class="hljs-keyword">if</span> on_macos <span class="hljs-keyword">else</span> <span class="hljs-string">&#x27;PPL&#x27;</span>
+
+        embree_config_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;-G&#x27;</span>,
+            <span class="hljs-string">&#x27;Unix Makefiles&#x27;</span> <span class="hljs-keyword">if</span> on_macos <span class="hljs-keyword">else</span> <span class="hljs-string">&#x27;Visual Studio 16 2019&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_SYSTEM_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_INSTALL_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">&#x27;-DEMBREE_LIBRARY_NAME=embree3_RH&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DEMBREE_TASKING_SYSTEM=<span class="hljs-subst">{tasking_system}</span>&#x27;</span>, <span class="hljs-comment"># tbb (thread building blocks), ppl (parallel patterns library, windows only), internal</span>
+            <span class="hljs-string">&#x27;-DEMBREE_ISPC_SUPPORT=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DEMBREE_TUTORIALS=OFF&#x27;</span>,
+            <span class="hljs-comment">#&#x27;-dopenexr_lib_suffix=-rh-2_5&#x27;,</span>
+            <span class="hljs-comment">#&#x27;-dilmbase_lib_suffix=-rh-2_5&#x27;,</span>
+            <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+        ]
+
+        embree_config_process = subprocess.run(embree_config_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> embree_config_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(embree_config_process.stdout)
+            <span class="hljs-built_in">print</span>(embree_config_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;embree configuration failed&quot;</span>)
+
+        embree_build_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;--build&#x27;</span>,
+            <span class="hljs-string">&#x27;.&#x27;</span>,
+            <span class="hljs-string">&#x27;--target&#x27;</span>,
+            <span class="hljs-string">&#x27;install&#x27;</span>,
+            <span class="hljs-string">&#x27;--config&#x27;</span>,
+            <span class="hljs-string">&#x27;release&#x27;</span>
+        ]
+        embree_build_process = subprocess.run(embree_build_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> embree_build_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(embree_build_process.stdout)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;embree build failed&quot;</span>)
+
+        already_built.touch()
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;embree already built&quot;</span>)
+</code></pre>
+</div></div><div class="codefragment"><div class="fragmentname">&lt;&lt;embree package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">embree_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">embree_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">embree_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">pass</span>
+
+&lt;&lt;embree builder&gt;&gt;
+
+<span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">embree</span>():
+    &lt;&lt;embree version&gt;&gt;
+    &lt;&lt;embree download location&gt;&gt;
+    embree_local = dl_folder / <span class="hljs-string">f&#x27;embree_<span class="hljs-subst">{embree_version}</span>.zip&#x27;</span>
+    embree_dep = Package(<span class="hljs-string">&quot;embree&quot;</span>, embree_version, embree_url, embree_local,
+                            download_and_extract_package,
+                            embree_include_dir, embree_library_dir, no_patches,
+                            embree_build, embree_package,
+                            [], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> embree_dep
+</code></pre>
+</div></div><h3>Building libTIFF</h3>
+<p>The library <code>libTIFF</code> is a required dependency for <code>OpenImageIO</code>.</p>
+<p>the version of the libTIFF library used is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libtiff version&gt;&gt;=</div><div class="code"><pre><code>libtiff_version = <span class="hljs-string">&#x27;4.3.0&#x27;</span>
+</code></pre>
+</div></div><p>with this information we can generate the download location of the library from
+GitLab</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libtiff download location&gt;&gt;=</div><div class="code"><pre><code>libtiff_url = <span class="hljs-string">f&#x27;https://gitlab.com/libtiff/libtiff/-/archive/v<span class="hljs-subst">{libtiff_version}</span>/libtiff-v<span class="hljs-subst">{libtiff_version}</span>.zip&#x27;</span>
+</code></pre>
+</div></div><p>Building of libtiff is managed through cmake. There are not many settings to
+handle, but we do ensure we have control over where the building happens and
+where the resulting files get copied to.</p>
+<h4>Patching libTIFF</h4>
+<p>To be able to configure the library properly we are going to apply a patch that
+will disable many parts of the CMake configuration process. This is done primarily for the benefit of MacOS, but it doesn't hurt to do on Windows, either.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libtiff patcher&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libtiff_patch</span>(<span class="hljs-params">self</span>):
+    patch_file = current_path / <span class="hljs-string">&#x27;patches&#x27;</span> / <span class="hljs-string">&#x27;libtiff_build_system.patch&#x27;</span>
+    patch_file_applied = build_folder / <span class="hljs-string">&#x27;libtiff_build_system.patch.applied&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> patch_file_applied.exists():
+        patch_command = [
+            <span class="hljs-string">&#x27;git&#x27;</span>,
+            <span class="hljs-string">&#x27;apply&#x27;</span>,
+            <span class="hljs-string">&#x27;--ignore-space-change&#x27;</span>,
+            <span class="hljs-string">&#x27;--ignore-whitespace&#x27;</span>,
+            <span class="hljs-string">&#x27;--whitespace=nowarn&#x27;</span>,
+            <span class="hljs-string">&#x27;-p1&#x27;</span>,
+            <span class="hljs-string">f&quot;<span class="hljs-subst">{patch_file}</span>&quot;</span>
+        ]
+        patch_process = subprocess.run(patch_command, cwd=self.extract_location, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, universal_newlines=<span class="hljs-string">&#x27;\n&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> patch_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(patch_process.stderr)
+            <span class="hljs-built_in">print</span>(patch_process.stdout)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;libtiff patching failed.&quot;</span>)
+        patch_file_applied.touch()
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;libtiff patch successfully applied.&quot;</span>)
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">&quot;libtiff patch already applied.&quot;</span>)
+</code></pre>
+</div></div><h4>Configuring and buildng libTIFF</h4>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libtiff builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libtiff_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-built_in">print</span>(self.extract_location)
+    already_built = build_folder / <span class="hljs-string">&#x27;libtiff.built&#x27;</span>
+    <span class="hljs-comment"># we shouldn&#x27;t build in the source directory (extract_location)</span>
+    build_dir = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libtiff_build&#x27;</span>
+    install_dir = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libtiff_install&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        <span class="hljs-keyword">if</span> build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        <span class="hljs-keyword">if</span> install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        <span class="hljs-keyword">for</span> p <span class="hljs-keyword">in</span> packages:
+            <span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;zlib&#x27;</span>:
+                zlib_library = p.get_library_dir(p)
+                zlib_include_dir = p.get_include_dir(p)
+            <span class="hljs-keyword">if</span> p.name.lower() == <span class="hljs-string">&#x27;libjpeg&#x27;</span>:
+                jpeg_library = p.get_library_dir(p)
+                jpeg_include_dir = p.get_include_dir(p)
+
+        libtiff_config_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;-G&#x27;</span>,
+            <span class="hljs-string">&#x27;Unix Makefiles&#x27;</span> <span class="hljs-keyword">if</span> on_macos <span class="hljs-keyword">else</span> <span class="hljs-string">&#x27;Visual Studio 16 2019&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_SYSTEM_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_INSTALL_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">&#x27;-DBUILD_SHARED_LIBS=OFF&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DZLIB_LIBRARY=<span class="hljs-subst">{zlib_library}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DZLIB_INCLUDE_DIR=<span class="hljs-subst">{zlib_include_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DJPEG_LIBRARY=<span class="hljs-subst">{jpeg_library}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DJPEG_INCLUDE_DIR=<span class="hljs-subst">{jpeg_include_dir}</span>&#x27;</span>,
+            <span class="hljs-string">&#x27;-Dlerc=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-Dlibdeflate=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-Djbig=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-Djpeg12=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-Dwebp=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-Dzstd=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DENABLE_WebP=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DENABLE_WEBP=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DENABLE_ZSTD=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DENABLE_JPEG12=OFF&#x27;</span>,
+            <span class="hljs-string">&#x27;-DENABLE_JBIG=OFF&#x27;</span>,
+            <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+        ]
+
+        libtiff_config_process = subprocess.run(libtiff_config_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> libtiff_config_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(libtiff_config_process.stdout)
+            <span class="hljs-built_in">print</span>(libtiff_config_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;libtiff configuration failed&quot;</span>)
+
+        libtiff_build_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;--build&#x27;</span>,
+            <span class="hljs-string">&#x27;.&#x27;</span>,
+            <span class="hljs-string">&#x27;--target&#x27;</span>,
+            <span class="hljs-string">&#x27;install&#x27;</span>,
+            <span class="hljs-string">&#x27;--config&#x27;</span>,
+            <span class="hljs-string">&#x27;release&#x27;</span>
+        ]
+        libtiff_build_process = subprocess.run(libtiff_build_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> libtiff_build_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(libtiff_build_process.stdout)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;libtiff build failed&quot;</span>)
+
+        already_built.touch()
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;libtiff already built&quot;</span>)
+</code></pre>
+</div></div><div class="codefragment"><div class="fragmentname">&lt;&lt;libtiff package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libtiff_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    install_dir = (Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libtiff_install&#x27;</span> / <span class="hljs-string">&#x27;include&#x27;</span>).resolve()
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{install_dir}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libtiff_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">if</span> on_macos:
+        lib = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libtiff_install&#x27;</span> / <span class="hljs-string">&#x27;lib&#x27;</span> / <span class="hljs-string">&#x27;libtiff.a&#x27;</span>
+    <span class="hljs-keyword">else</span>:
+        lib = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libtiff_install&#x27;</span> / <span class="hljs-string">&#x27;lib&#x27;</span> / <span class="hljs-string">&#x27;tiff.lib&#x27;</span>
+    lib = lib.resolve()
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{lib}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libtiff_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">pass</span>
+
+&lt;&lt;libtiff patcher&gt;&gt;
+&lt;&lt;libtiff builder&gt;&gt;
+
+<span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libtiff</span>():
+    &lt;&lt;libtiff version&gt;&gt;
+    &lt;&lt;libtiff download location&gt;&gt;
+    libtiff_local = dl_folder / <span class="hljs-string">f&#x27;libtiff_<span class="hljs-subst">{libtiff_version}</span>.zip&#x27;</span>
+    libtiff_dep = Package(<span class="hljs-string">&quot;libtiff&quot;</span>, libtiff_version, libtiff_url, libtiff_local,
+                            download_and_extract_package,
+                            libtiff_include_dir, libtiff_library_dir, libtiff_patch,
+                            libtiff_build, libtiff_package,
+                            [<span class="hljs-string">&#x27;libjpeg&#x27;</span>], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> libtiff_dep
+</code></pre>
+</div></div><h3>Building libJPEG</h3>
+<p>The library <code>libJPEG</code> is a required dependency for <code>OpenImageIO</code>.</p>
+<p>the version of the libJPEG library used is</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libjpeg version&gt;&gt;=</div><div class="code"><pre><code>libjpeg_version = <span class="hljs-string">&#x27;2.1.1&#x27;</span>
+</code></pre>
+</div></div><p>with this information we can generate the download location of the library from
+GitLab</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libjpeg download location&gt;&gt;=</div><div class="code"><pre><code>libjpeg_url = <span class="hljs-string">f&#x27;https://github.com/libjpeg-turbo/libjpeg-turbo/archive/refs/tags/<span class="hljs-subst">{libjpeg_version}</span>.zip&#x27;</span>
+</code></pre>
+</div></div><p>building of libjpeg is managed through cmake. There are not many settings to
+handle, but we do ensure we have control over where the building happens and
+where the resulting files get copied to.</p>
+<div class="codefragment"><div class="fragmentname">&lt;&lt;libjpeg builder&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libjpeg_build</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-built_in">print</span>(self.extract_location)
+    already_built = build_folder / <span class="hljs-string">&#x27;libjpeg.built&#x27;</span>
+    <span class="hljs-comment"># we shouldn&#x27;t build in the source directory (extract_location)</span>
+    build_dir = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libjpeg_build&#x27;</span>
+    install_dir = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libjpeg_install&#x27;</span>
+
+    <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> already_built.exists():
+        <span class="hljs-keyword">if</span> build_dir.exists():
+            folder_recursive_delete(build_dir)
+        build_dir.mkdir()
+
+        <span class="hljs-keyword">if</span> install_dir.exists():
+            folder_recursive_delete(install_dir)
+        install_dir.mkdir()
+
+        libjpeg_config_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;-G&#x27;</span>,
+            <span class="hljs-string">&#x27;Unix Makefiles&#x27;</span> <span class="hljs-keyword">if</span> on_macos <span class="hljs-keyword">else</span> <span class="hljs-string">&#x27;Visual Studio 16 2019&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_SYSTEM_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&#x27;-DCMAKE_INSTALL_PREFIX=<span class="hljs-subst">{install_dir}</span>&#x27;</span>,
+            <span class="hljs-string">f&quot;<span class="hljs-subst">{self.extract_location}</span>&quot;</span>
+        ]
+
+        libjpeg_config_process = subprocess.run(libjpeg_config_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> libjpeg_config_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(libjpeg_config_process.stdout)
+            <span class="hljs-built_in">print</span>(libjpeg_config_process.stderr)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;libjpeg configuration failed&quot;</span>)
+
+        libjpeg_build_cmake = [
+            <span class="hljs-string">&#x27;cmake&#x27;</span>,
+            <span class="hljs-string">&#x27;--build&#x27;</span>,
+            <span class="hljs-string">&#x27;.&#x27;</span>,
+            <span class="hljs-string">&#x27;--target&#x27;</span>,
+            <span class="hljs-string">&#x27;install&#x27;</span>,
+            <span class="hljs-string">&#x27;--config&#x27;</span>,
+            <span class="hljs-string">&#x27;release&#x27;</span>
+        ]
+        libjpeg_build_process = subprocess.run(libjpeg_build_cmake, cwd=build_dir, encoding=<span class="hljs-string">&#x27;utf-8&#x27;</span>, capture_output=<span class="hljs-literal">True</span>)
+        <span class="hljs-keyword">if</span> libjpeg_build_process.returncode!=<span class="hljs-number">0</span>:
+            <span class="hljs-built_in">print</span>(libjpeg_build_process.stdout)
+            <span class="hljs-keyword">raise</span> Exception(<span class="hljs-string">&quot;libjpeg build failed&quot;</span>)
+
+        already_built.touch()
+    <span class="hljs-keyword">else</span>:
+        <span class="hljs-built_in">print</span>(<span class="hljs-string">f&quot;libjpeg already built&quot;</span>)
+</code></pre>
+</div></div><div class="codefragment"><div class="fragmentname">&lt;&lt;libjpeg package&gt;&gt;=</div><div class="code"><pre><code><span class="hljs-keyword">def</span> <span class="hljs-title function_">libjpeg_include_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    install_dir = (Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libjpeg_install&#x27;</span> / <span class="hljs-string">&#x27;include&#x27;</span>).resolve()
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{install_dir}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libjpeg_library_dir</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">if</span> on_macos:
+        lib = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libjpeg_install&#x27;</span> / <span class="hljs-string">&#x27;lib&#x27;</span> / <span class="hljs-string">&#x27;libjpeg.a&#x27;</span>
+    <span class="hljs-keyword">else</span>:
+        lib = Path(self.extract_location) / <span class="hljs-string">&#x27;..&#x27;</span> / <span class="hljs-string">&#x27;libjpeg_install&#x27;</span> / <span class="hljs-string">&#x27;lib&#x27;</span> / <span class="hljs-string">&#x27;jpeg.lib&#x27;</span>
+    lib = lib.resolve()
+    <span class="hljs-keyword">return</span> <span class="hljs-string">f&quot;<span class="hljs-subst">{lib}</span>&quot;</span>
+
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libjpeg_package</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">pass</span>
+
+&lt;&lt;libjpeg builder&gt;&gt;
+
+<span class="hljs-meta">@register_package</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">libjpeg</span>():
+    &lt;&lt;libjpeg version&gt;&gt;
+    &lt;&lt;libjpeg download location&gt;&gt;
+    libjpeg_local = dl_folder / <span class="hljs-string">f&#x27;libjpeg_<span class="hljs-subst">{libjpeg_version}</span>.zip&#x27;</span>
+    libjpeg_dep = Package(<span class="hljs-string">&quot;libjpeg&quot;</span>, libjpeg_version, libjpeg_url, libjpeg_local,
+                            download_and_extract_package,
+                            libjpeg_include_dir, libjpeg_library_dir, no_patches,
+                            libjpeg_build, libjpeg_package,
+                            [], <span class="hljs-string">&#x27;&#x27;</span>)
+    <span class="hljs-keyword">return</span> libjpeg_dep
+</code></pre>
+</div></div>
+	</body>
+</html>
